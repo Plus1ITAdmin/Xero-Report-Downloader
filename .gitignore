@@ -10,6 +10,7 @@ backend/node_modules/
 # Build / scratch output
 /tmp-export/
 *.log
+*.zip
 
 # OS / editor cruft
 .DS_Store
