@@ -1,0 +1,215 @@
+/*
+ * Xero Report Downloader — local backend proxy
+ * -------------------------------------------------------------------------
+ * Why this exists: the Xero API does NOT send CORS headers, so a browser can
+ * never call it directly. This tiny Express server sits in front of Xero and:
+ *   1. Runs the OAuth 2.0 "Authorization Code" flow (keeps the client secret
+ *      server-side) and holds the resulting tokens.
+ *   2. Proxies the calls the frontend needs (/connections + /Reports/*),
+ *      attaching the access token + Xero-tenant-id header.
+ *   3. Serves the static frontend in ../public.
+ *
+ * TESTING-ONLY NOTES:
+ *   - Tokens are kept in a single in-memory slot (one signed-in user at a time).
+ *     That is fine for local testing; production needs per-user sessions.
+ *   - CORS defaults to "*" so you can also open the frontend from elsewhere
+ *     during testing. Lock ALLOWED_ORIGIN down before exposing this anywhere.
+ * -------------------------------------------------------------------------
+ */
+import 'dotenv/config';
+import express from 'express';
+import crypto from 'node:crypto';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const {
+  XERO_CLIENT_ID,
+  XERO_CLIENT_SECRET,
+  XERO_REDIRECT_URI = 'http://localhost:3000/callback',
+  XERO_SCOPES = 'openid profile email offline_access accounting.reports.read accounting.settings.read accounting.transactions.read accounting.contacts.read',
+  PORT = 3000,
+  ALLOWED_ORIGIN = '*',
+} = process.env;
+
+// --- Xero endpoints -------------------------------------------------------
+const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize';
+const XERO_TOKEN_URL = 'https://identity.xero.com/connect/token';
+const XERO_CONNECTIONS_URL = 'https://api.xero.com/connections';
+const XERO_API_BASE = 'https://api.xero.com/api.xro/2.0';
+
+// Whitelisted query params per report type. Anything not listed is dropped so
+// the frontend can never push unexpected params at Xero.
+const REPORT_PARAMS = {
+  ProfitAndLoss: ['fromDate', 'toDate', 'periods', 'timeframe', 'trackingCategoryID', 'trackingOptionID', 'standardLayout', 'paymentsOnly'],
+  BalanceSheet: ['date', 'periods', 'timeframe', 'trackingOptionID1', 'trackingOptionID2', 'standardLayout', 'paymentsOnly'],
+  TrialBalance: ['date', 'paymentsOnly'],
+  BankSummary: ['fromDate', 'toDate'],
+  ExecutiveSummary: ['date'],
+  BudgetSummary: ['date', 'periods', 'timeframe'],
+};
+
+if (!XERO_CLIENT_ID || !XERO_CLIENT_SECRET) {
+  console.warn(
+    '\n⚠  XERO_CLIENT_ID / XERO_CLIENT_SECRET are not set.\n' +
+    '   Copy backend/.env.example to backend/.env and fill them in.\n' +
+    '   The page still loads in Demo mode, but "Connect to Xero" will not work.\n'
+  );
+}
+
+// --- In-memory token store (single user, testing only) --------------------
+let tokenStore = null; // { access_token, refresh_token, expires_at }
+const pendingStates = new Set();
+
+const app = express();
+app.use(express.json());
+
+// Minimal CORS. No cookies are used (tokens live server-side), so reflecting a
+// configurable origin is safe for a local testing proxy.
+app.use((req, res, next) => {
+  res.set('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
+  res.set('Vary', 'Origin');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+const basicAuthHeader = () =>
+  'Basic ' + Buffer.from(`${XERO_CLIENT_ID}:${XERO_CLIENT_SECRET}`).toString('base64');
+
+/** POST to Xero's token endpoint and cache the result. */
+async function requestToken(params) {
+  const res = await fetch(XERO_TOKEN_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: basicAuthHeader(),
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: new URLSearchParams(params).toString(),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`Xero token request failed (${res.status}): ${text}`);
+  const data = JSON.parse(text);
+  tokenStore = {
+    access_token: data.access_token,
+    refresh_token: data.refresh_token || (tokenStore && tokenStore.refresh_token),
+    expires_at: Date.now() + (data.expires_in || 1800) * 1000,
+  };
+  return tokenStore;
+}
+
+/** Return a valid access token, transparently refreshing if it has expired. */
+async function getValidAccessToken() {
+  if (!tokenStore) {
+    const err = new Error('Not connected to Xero. Click "Connect to Xero" first.');
+    err.status = 401;
+    throw err;
+  }
+  if (Date.now() > tokenStore.expires_at - 30_000) {
+    if (!tokenStore.refresh_token) {
+      tokenStore = null;
+      const err = new Error('Session expired. Please reconnect to Xero.');
+      err.status = 401;
+      throw err;
+    }
+    await requestToken({ grant_type: 'refresh_token', refresh_token: tokenStore.refresh_token });
+  }
+  return tokenStore.access_token;
+}
+
+// --- Auth routes ----------------------------------------------------------
+app.get('/auth/login', (req, res) => {
+  if (!XERO_CLIENT_ID) return res.status(500).send('Server is missing XERO_CLIENT_ID (see backend/.env).');
+  const state = crypto.randomBytes(16).toString('hex');
+  pendingStates.add(state);
+  const url = new URL(XERO_AUTHORIZE_URL);
+  url.searchParams.set('response_type', 'code');
+  url.searchParams.set('client_id', XERO_CLIENT_ID);
+  url.searchParams.set('redirect_uri', XERO_REDIRECT_URI);
+  url.searchParams.set('scope', XERO_SCOPES);
+  url.searchParams.set('state', state);
+  res.redirect(url.toString());
+});
+
+async function handleCallback(req, res) {
+  const { code, state, error, error_description: desc } = req.query;
+  if (error) return res.status(400).send(`Xero returned an error: ${error} — ${desc || ''}`);
+  if (!code || !state || !pendingStates.has(state)) {
+    return res.status(400).send('Invalid or expired sign-in state. Please try "Connect to Xero" again.');
+  }
+  pendingStates.delete(state);
+  try {
+    await requestToken({ grant_type: 'authorization_code', code, redirect_uri: XERO_REDIRECT_URI });
+    res.redirect('/?connected=1');
+  } catch (e) {
+    res.status(500).send('Failed to complete Xero sign-in: ' + e.message);
+  }
+}
+// Accept either path so it still works if the redirect URI was registered as
+// /callback or /auth/callback in the Xero app.
+app.get('/callback', handleCallback);
+app.get('/auth/callback', handleCallback);
+
+app.get('/auth/status', (req, res) => {
+  res.json({
+    connected: !!tokenStore,
+    configured: !!(XERO_CLIENT_ID && XERO_CLIENT_SECRET),
+  });
+});
+
+app.post('/auth/logout', (req, res) => {
+  tokenStore = null;
+  res.json({ ok: true });
+});
+
+// --- API proxy routes -----------------------------------------------------
+app.get('/api/connections', async (req, res) => {
+  try {
+    const token = await getValidAccessToken();
+    const r = await fetch(XERO_CONNECTIONS_URL, {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+    });
+    const body = await r.text();
+    res.status(r.status).type('application/json').send(body);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.get('/api/report', async (req, res) => {
+  const { tenantId, type } = req.query;
+  if (!tenantId) return res.status(400).json({ error: 'Missing tenantId' });
+  const allowed = REPORT_PARAMS[type];
+  if (!allowed) return res.status(400).json({ error: `Unknown or unsupported report type: ${type}` });
+  try {
+    const token = await getValidAccessToken();
+    const url = new URL(`${XERO_API_BASE}/Reports/${type}`);
+    for (const key of allowed) {
+      const v = req.query[key];
+      if (v !== undefined && v !== '') url.searchParams.set(key, v);
+    }
+    const r = await fetch(url.toString(), {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Xero-tenant-id': tenantId,
+        Accept: 'application/json',
+      },
+    });
+    const body = await r.text();
+    res.status(r.status).type('application/json').send(body);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// --- Static frontend ------------------------------------------------------
+app.use(express.static(path.join(__dirname, '..', 'public')));
+
+app.listen(PORT, () => {
+  console.log(`\n✅ Xero Report Downloader running at  http://localhost:${PORT}`);
+  console.log(`   Redirect URI in use:  ${XERO_REDIRECT_URI}`);
+  if (!XERO_CLIENT_ID) console.log('   (Demo mode only — add credentials to backend/.env to connect to Xero.)');
+  console.log('');
+});
