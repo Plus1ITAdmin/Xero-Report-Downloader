@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Xero Report Downloader</title>
+
+<!-- Export libraries (CDN). PDF: jsPDF + autotable · Excel: SheetJS · Zip: JSZip -->
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script defer src="report-core.js"></script>
+<script defer src="report-render.js"></script>
+
+<style>
+  /* Everything is scoped under #xrd so this can be dropped into another page as a tab. */
+  #xrd {
+    --accent: #1aa7c8;
+    --accent-dark: #0f7d97;
+    --ink: #1f2933;
+    --muted: #6b7785;
+    --line: #e3e8ee;
+    --bg: #f5f7fa;
+    --card: #ffffff;
+    --ok: #1f9d57;
+    --err: #d23b3b;
+    --radius: 10px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--ink);
+    background: var(--bg);
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+    box-sizing: border-box;
+    min-height: 100%;
+  }
+  #xrd *, #xrd *::before, #xrd *::after { box-sizing: inherit; }
+  #xrd .wrap { max-width: 920px; margin: 0 auto; padding: 24px 20px 80px; }
+
+  /* Header */
+  #xrd .topbar { display: flex; align-items: center; gap: 14px; margin-bottom: 20px; }
+  #xrd .topbar h1 { font-size: 20px; margin: 0; font-weight: 700; }
+  #xrd .topbar .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  #xrd .spacer { flex: 1; }
+  #xrd .demo-toggle { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); cursor: pointer; user-select: none; }
+  #xrd .switch { position: relative; width: 38px; height: 22px; background: #cbd3dc; border-radius: 999px; transition: background .15s; flex: none; }
+  #xrd .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; background: #fff; border-radius: 50%; transition: transform .15s; box-shadow: 0 1px 2px rgba(0,0,0,.25); }
+  #xrd .demo-toggle input { display: none; }
+  #xrd .demo-toggle input:checked + .switch { background: var(--accent); }
+  #xrd .demo-toggle input:checked + .switch::after { transform: translateX(16px); }
+
+  /* Cards / steps */
+  #xrd .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px 20px; margin-bottom: 16px; }
+  #xrd .card.disabled { opacity: .55; pointer-events: none; }
+  #xrd .step-head { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  #xrd .step-num { width: 24px; height: 24px; border-radius: 50%; background: var(--accent); color: #fff; font-size: 13px; font-weight: 700; display: grid; place-items: center; flex: none; }
+  #xrd .step-head h2 { font-size: 15px; margin: 0; font-weight: 600; }
+  #xrd .step-head .hint { color: var(--muted); font-size: 12.5px; font-weight: 400; }
+
+  /* Buttons */
+  #xrd button { font-family: inherit; cursor: pointer; border-radius: 8px; border: 1px solid transparent; font-size: 14px; }
+  #xrd .btn-primary { background: var(--accent); color: #fff; padding: 10px 18px; font-weight: 600; }
+  #xrd .btn-primary:hover { background: var(--accent-dark); }
+  #xrd .btn-primary:disabled { background: #b6c2cd; cursor: not-allowed; }
+  #xrd .btn-ghost { background: #fff; border-color: var(--line); color: var(--ink); padding: 7px 12px; }
+  #xrd .btn-ghost:hover { border-color: #c2ccd6; }
+  #xrd .btn-link { background: none; color: var(--accent-dark); padding: 4px 6px; text-decoration: underline; }
+
+  /* Connection */
+  #xrd .conn-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  #xrd .pill { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; padding: 4px 11px; border-radius: 999px; background: #eef1f5; color: var(--muted); }
+  #xrd .pill .dot { width: 8px; height: 8px; border-radius: 50%; background: #b6c2cd; }
+  #xrd .pill.connected { background: #e6f6ee; color: var(--ok); }
+  #xrd .pill.connected .dot { background: var(--ok); }
+  #xrd .conn-note { font-size: 12.5px; color: var(--muted); margin-top: 10px; }
+
+  /* Org switcher (Xero-style) */
+  #xrd .org { position: relative; max-width: 420px; }
+  #xrd .org-trigger { width: 100%; display: flex; align-items: center; gap: 11px; padding: 9px 12px; background: #fff; border: 1px solid var(--line); border-radius: 8px; text-align: left; }
+  #xrd .org-trigger:hover { border-color: #c2ccd6; }
+  #xrd .org-trigger .caret { margin-left: auto; color: var(--muted); transition: transform .15s; }
+  #xrd .org.open .org-trigger .caret { transform: rotate(180deg); }
+  #xrd .avatar { width: 30px; height: 30px; border-radius: 6px; color: #fff; font-weight: 700; font-size: 13px; display: grid; place-items: center; flex: none; }
+  #xrd .org-trigger .org-text { overflow: hidden; }
+  #xrd .org-trigger .org-text b { display: block; font-size: 14px; font-weight: 600; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
+  #xrd .org-trigger .org-text span { font-size: 12px; color: var(--muted); }
+  #xrd .org-panel { position: absolute; z-index: 30; top: calc(100% + 6px); left: 0; right: 0; background: #fff; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 8px 28px rgba(20,30,45,.14); display: none; overflow: hidden; }
+  #xrd .org.open .org-panel { display: block; }
+  #xrd .org-search { padding: 10px; border-bottom: 1px solid var(--line); }
+  #xrd .org-search input { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; font-size: 13px; font-family: inherit; }
+  #xrd .org-list { max-height: 280px; overflow-y: auto; }
+  #xrd .org-item { display: flex; align-items: center; gap: 11px; width: 100%; padding: 9px 12px; background: none; border: none; text-align: left; font-size: 14px; }
+  #xrd .org-item:hover { background: #f1f6f9; }
+  #xrd .org-item.selected { background: #e7f4f8; }
+  #xrd .org-item .check { margin-left: auto; color: var(--accent); visibility: hidden; }
+  #xrd .org-item.selected .check { visibility: visible; }
+  #xrd .org-empty { padding: 16px; color: var(--muted); font-size: 13px; text-align: center; }
+
+  /* Date + comparison controls */
+  #xrd .controls-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; }
+  #xrd .field label { display: block; font-size: 12.5px; color: var(--muted); margin-bottom: 5px; font-weight: 500; }
+  #xrd .field input, #xrd .field select { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; font-size: 14px; font-family: inherit; background: #fff; }
+  #xrd .controls-foot { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-top: 14px; }
+  #xrd .check-inline { display: flex; align-items: center; gap: 8px; font-size: 13.5px; cursor: pointer; user-select: none; }
+  #xrd .compare-custom { display: none; gap: 10px; }
+  #xrd .compare-custom.show { display: flex; }
+  #xrd .compare-custom .field { min-width: 120px; }
+
+  /* Report checklist */
+  #xrd .report-item { display: grid; grid-template-columns: 22px 1fr; gap: 0 12px; align-items: start; padding: 11px 4px; border-bottom: 1px solid var(--line); }
+  #xrd .report-item:last-child { border-bottom: none; }
+  #xrd .report-item input[type=checkbox] { width: 17px; height: 17px; margin-top: 2px; accent-color: var(--accent); cursor: pointer; }
+  #xrd .report-main { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+  #xrd .report-name { font-size: 14.5px; font-weight: 500; }
+  #xrd .tag { font-size: 11px; color: var(--muted); background: #eef1f5; padding: 2px 7px; border-radius: 5px; }
+  #xrd .tag.cmp { color: var(--accent-dark); background: #e7f4f8; }
+  #xrd .report-dates { grid-column: 2; display: none; gap: 10px; margin-top: 9px; flex-wrap: wrap; }
+  #xrd .report-dates.show { display: flex; }
+  #xrd .report-dates .field { min-width: 150px; }
+  #xrd .select-row { display: flex; gap: 14px; margin-bottom: 6px; }
+
+  /* Output options */
+  #xrd .opt-group { display: flex; gap: 10px; flex-wrap: wrap; }
+  #xrd .opt { position: relative; }
+  #xrd .opt input { position: absolute; opacity: 0; }
+  #xrd .opt span { display: block; padding: 9px 16px; border: 1px solid var(--line); border-radius: 8px; font-size: 13.5px; background: #fff; }
+  #xrd .opt input:checked + span { border-color: var(--accent); background: #e7f4f8; color: var(--accent-dark); font-weight: 600; }
+  #xrd .opt-block { margin-bottom: 16px; }
+  #xrd .opt-block > .lbl { font-size: 12.5px; color: var(--muted); margin-bottom: 7px; font-weight: 500; }
+
+  /* Export + log */
+  #xrd .export-row { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  #xrd .log { margin-top: 14px; font-size: 13px; max-height: 200px; overflow-y: auto; display: none; }
+  #xrd .log.show { display: block; }
+  #xrd .log-line { padding: 3px 0; color: var(--muted); display: flex; gap: 8px; }
+  #xrd .log-line.ok { color: var(--ok); }
+  #xrd .log-line.err { color: var(--err); }
+  #xrd .spin { width: 15px; height: 15px; border: 2px solid #d6dee6; border-top-color: var(--accent); border-radius: 50%; animation: xrdspin .7s linear infinite; display: inline-block; }
+  @keyframes xrdspin { to { transform: rotate(360deg); } }
+
+  /* Toast */
+  #xrd .toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%); background: var(--ink); color: #fff; padding: 11px 18px; border-radius: 8px; font-size: 13.5px; box-shadow: 0 6px 24px rgba(0,0,0,.25); opacity: 0; pointer-events: none; transition: opacity .25s, transform .25s; z-index: 60; }
+  #xrd .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  #xrd .banner { background: #fff7e6; border: 1px solid #f0d9a0; color: #8a6d1f; font-size: 13px; padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; }
+</style>
+</head>
+<body>
+<div id="xrd">
+  <div class="wrap">
+
+    <div class="topbar">
+      <div>
+        <h1>Xero Report Downloader</h1>
+        <div class="sub">Pick a client, choose reports & dates, export to PDF or Excel.</div>
+      </div>
+      <div class="spacer"></div>
+      <label class="demo-toggle" title="Explore the interface with sample data — no Xero connection needed">
+        <input type="checkbox" id="demoToggle" />
+        <span class="switch"></span>
+        Demo mode
+      </label>
+    </div>
+
+    <div id="configBanner" class="banner" style="display:none"></div>
+
+    <!-- Step 1 — Connect -->
+    <section class="card" id="cardConnect">
+      <div class="step-head"><span class="step-num">1</span><h2>Connect to Xero</h2></div>
+      <div class="conn-row">
+        <button class="btn-primary" id="connectBtn">Connect to Xero</button>
+        <span class="pill" id="connPill"><span class="dot"></span><span id="connText">Not connected</span></span>
+        <button class="btn-link" id="logoutBtn" style="display:none">Disconnect</button>
+      </div>
+      <div class="conn-note">
+        You'll be redirected to Xero to sign in and authorise access. Authorise each client organisation once —
+        they'll then appear in the dropdown below.
+      </div>
+    </section>
+
+    <!-- Step 2 — Client -->
+    <section class="card disabled" id="cardClient">
+      <div class="step-head"><span class="step-num">2</span><h2>Select client</h2><span class="hint">the organisation to report on</span></div>
+      <div class="org" id="org">
+        <button class="org-trigger" id="orgTrigger" type="button" aria-haspopup="listbox" aria-expanded="false">
+          <span class="avatar" id="orgAvatar" style="background:#b6c2cd">–</span>
+          <span class="org-text"><b id="orgName">Select an organisation</b><span id="orgMeta">No organisation selected</span></span>
+          <span class="caret">▾</span>
+        </button>
+        <div class="org-panel" id="orgPanel" role="listbox">
+          <div class="org-search"><input type="text" id="orgSearch" placeholder="Search organisations…" autocomplete="off" /></div>
+          <div class="org-list" id="orgList"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Step 3 — Reports + dates -->
+    <section class="card disabled" id="cardReports">
+      <div class="step-head"><span class="step-num">3</span><h2>Choose reports &amp; dates</h2></div>
+
+      <div class="controls-grid">
+        <div class="field"><label for="masterStart">Period start (date-range reports)</label><input type="date" id="masterStart" /></div>
+        <div class="field"><label for="masterEnd">Period end / as-at date</label><input type="date" id="masterEnd" /></div>
+        <div class="field">
+          <label for="compareMode">Compare with</label>
+          <select id="compareMode">
+            <option value="none">No comparison</option>
+            <option value="prevPeriod">Previous period</option>
+            <option value="prevYear">Previous year</option>
+            <option value="custom">Custom…</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="controls-foot">
+        <label class="check-inline"><input type="checkbox" id="individualToggle" /> Set dates individually per report</label>
+        <button class="btn-ghost" id="applyAllBtn" style="display:none">Apply master dates to all</button>
+        <div class="compare-custom" id="compareCustom">
+          <div class="field"><label>Periods</label><input type="number" id="compareCount" min="1" max="11" value="1" /></div>
+          <div class="field"><label>Interval</label>
+            <select id="compareTimeframe"><option value="MONTH">Month</option><option value="QUARTER">Quarter</option><option value="YEAR">Year</option></select>
+          </div>
+        </div>
+      </div>
+
+      <hr style="border:none;border-top:1px solid var(--line);margin:16px 0" />
+
+      <div class="select-row">
+        <button class="btn-link" id="selectAll">Select all</button>
+        <button class="btn-link" id="selectNone">Clear</button>
+      </div>
+      <div id="reportList"></div>
+    </section>
+
+    <!-- Step 4 — Output -->
+    <section class="card disabled" id="cardOutput">
+      <div class="step-head"><span class="step-num">4</span><h2>Export</h2></div>
+
+      <div class="opt-block">
+        <div class="lbl">Format</div>
+        <div class="opt-group">
+          <label class="opt"><input type="radio" name="format" value="pdf" checked /><span>📄 PDF</span></label>
+          <label class="opt"><input type="radio" name="format" value="excel" /><span>📊 Excel</span></label>
+        </div>
+      </div>
+
+      <div class="opt-block">
+        <div class="lbl">Packaging</div>
+        <div class="opt-group">
+          <label class="opt"><input type="radio" name="packaging" value="combined" checked /><span id="optCombined">One combined PDF</span></label>
+          <label class="opt"><input type="radio" name="packaging" value="separate" /><span>Separate files (ZIP)</span></label>
+        </div>
+      </div>
+
+      <div class="export-row">
+        <button class="btn-primary" id="exportBtn" disabled>Download reports</button>
+        <span id="exportSummary" style="font-size:13px;color:var(--muted)"></span>
+      </div>
+      <div class="log" id="log"></div>
+    </section>
+
+  </div>
+  <div class="toast" id="toast"></div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // When the frontend is served by the Express backend, same-origin '' works.
+  // If you later host this page elsewhere (e.g. GitHub Pages), set this to the
+  // backend's URL, e.g. "https://your-backend.example.com".
+  const API_BASE = "";
+
+  const REPORTS = [
+    { id: "ProfitAndLoss",    name: "Profit and Loss",   dateType: "range", periods: true  },
+    { id: "BalanceSheet",     name: "Balance Sheet",     dateType: "asAt",  periods: true  },
+    { id: "TrialBalance",     name: "Trial Balance",     dateType: "asAt",  periods: false },
+    { id: "BankSummary",      name: "Bank Summary",      dateType: "range", periods: false },
+    { id: "ExecutiveSummary", name: "Executive Summary", dateType: "asAt",  periods: false },
+    { id: "BudgetSummary",    name: "Budget Summary",    dateType: "asAt",  periods: true  },
+  ];
+
+  const state = {
+    demo: false,
+    connected: false,
+    configured: false,
+    tenants: [],
+    selectedTenantId: null,
+    selected: new Set(),
+    individualDates: false,
+    reportDates: {},               // id -> { start, end }
+    format: "pdf",
+    packaging: "combined",
+  };
+
+  const $ = (sel) => document.querySelector(sel);
+  const el = (id) => document.getElementById(id);
+
+  // ---- date helpers --------------------------------------------------------
+  const iso = (d) => d.toISOString().slice(0, 10);
+  function financialYearStart(today) {
+    const y = today.getFullYear();
+    return iso(new Date(today.getMonth() >= 6 ? y : y - 1, 6, 1)); // 1 July (AU FY)
+  }
+  function avatarColor(name) {
+    let h = 0;
+    for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) % 360;
+    return `hsl(${h} 52% 46%)`;
+  }
+
+  // ---- toast ---------------------------------------------------------------
+  let toastTimer;
+  function toast(msg) {
+    const t = el("toast");
+    t.textContent = msg; t.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => t.classList.remove("show"), 3200);
+  }
+
+  // =====================================================================
+  // Connection / status
+  // =====================================================================
+  async function refreshStatus() {
+    if (state.demo) return;
+    try {
+      const r = await fetch(`${API_BASE}/auth/status`);
+      const s = await r.json();
+      state.configured = !!s.configured;
+      state.connected = !!s.connected;
+      if (!s.configured) {
+        const b = el("configBanner");
+        b.style.display = "block";
+        b.innerHTML = "⚠ The backend has no Xero credentials yet. Add them to <code>backend/.env</code> and restart, " +
+                      "or flip on <b>Demo mode</b> (top-right) to explore the interface with sample data.";
+      }
+      if (state.connected) await loadConnections();
+    } catch (e) {
+      const b = el("configBanner");
+      b.style.display = "block";
+      b.textContent = "Couldn't reach the backend. Start it with `npm start` in the backend folder, or use Demo mode.";
+    }
+    renderConnection();
+  }
+
+  async function loadConnections() {
+    try {
+      const r = await fetch(`${API_BASE}/api/connections`);
+      if (!r.ok) throw new Error(await r.text());
+      state.tenants = await r.json();
+      renderOrgList();
+    } catch (e) {
+      toast("Could not load your organisations. Try reconnecting.");
+    }
+  }
+
+  function renderConnection() {
+    const pill = el("connPill"), text = el("connText");
+    const connected = state.connected || state.demo;
+    pill.classList.toggle("connected", connected);
+    text.textContent = state.demo ? "Demo mode" : (connected ? "Connected" : "Not connected");
+    el("connectBtn").style.display = connected ? "none" : "";
+    el("logoutBtn").style.display = (state.connected && !state.demo) ? "" : "none";
+    el("cardClient").classList.toggle("disabled", !connected);
+    updateGate();
+  }
+
+  // =====================================================================
+  // Org switcher (Xero-style dropdown)
+  // =====================================================================
+  function renderOrgList(filter) {
+    const list = el("orgList");
+    const q = (filter || "").toLowerCase();
+    const items = state.tenants.filter((t) => t.tenantName.toLowerCase().includes(q));
+    list.innerHTML = "";
+    if (!items.length) {
+      list.innerHTML = `<div class="org-empty">${state.tenants.length ? "No matches" : "No organisations connected yet"}</div>`;
+      return;
+    }
+    for (const t of items) {
+      const btn = document.createElement("button");
+      btn.className = "org-item" + (t.tenantId === state.selectedTenantId ? " selected" : "");
+      btn.type = "button";
+      btn.innerHTML =
+        `<span class="avatar" style="background:${avatarColor(t.tenantName)}">${t.tenantName[0].toUpperCase()}</span>` +
+        `<span>${t.tenantName}</span><span class="check">✓</span>`;
+      btn.addEventListener("click", () => { selectTenant(t.tenantId); closeOrg(); });
+      list.appendChild(btn);
+    }
+  }
+
+  function selectTenant(id) {
+    state.selectedTenantId = id;
+    const t = state.tenants.find((x) => x.tenantId === id);
+    if (t) {
+      el("orgAvatar").style.background = avatarColor(t.tenantName);
+      el("orgAvatar").textContent = t.tenantName[0].toUpperCase();
+      el("orgName").textContent = t.tenantName;
+      el("orgMeta").textContent = t.tenantType === "ORGANISATION" ? "Organisation" : (t.tenantType || "");
+    }
+    renderOrgList(el("orgSearch").value);
+    updateGate();
+  }
+
+  const openOrg = () => { el("org").classList.add("open"); el("orgTrigger").setAttribute("aria-expanded", "true"); el("orgSearch").focus(); };
+  const closeOrg = () => { el("org").classList.remove("open"); el("orgTrigger").setAttribute("aria-expanded", "false"); };
+
+  // =====================================================================
+  // Reports checklist
+  // =====================================================================
+  function buildReportList() {
+    const wrap = el("reportList");
+    wrap.innerHTML = "";
+    for (const r of REPORTS) {
+      const row = document.createElement("div");
+      row.className = "report-item";
+      const cmp = r.periods ? `<span class="tag cmp">comparison</span>` : "";
+      const typeTag = r.dateType === "range" ? "date range" : "as-at date";
+      const dateInputs = r.dateType === "range"
+        ? `<div class="field"><label>From</label><input type="date" data-date="start" data-id="${r.id}"></div>
+           <div class="field"><label>To</label><input type="date" data-date="end" data-id="${r.id}"></div>`
+        : `<div class="field"><label>As at</label><input type="date" data-date="end" data-id="${r.id}"></div>`;
+      row.innerHTML =
+        `<input type="checkbox" data-report="${r.id}">` +
+        `<div>` +
+          `<div class="report-main"><span class="report-name">${r.name}</span><span class="tag">${typeTag}</span>${cmp}</div>` +
+          `<div class="report-dates" data-dates="${r.id}">${dateInputs}</div>` +
+        `</div>`;
+      wrap.appendChild(row);
+    }
+    wrap.addEventListener("change", onReportListChange);
+  }
+
+  function onReportListChange(e) {
+    const t = e.target;
+    if (t.dataset.report) {
+      if (t.checked) state.selected.add(t.dataset.report); else state.selected.delete(t.dataset.report);
+      const dates = document.querySelector(`[data-dates="${t.dataset.report}"]`);
+      if (dates) dates.classList.toggle("show", t.checked && state.individualDates);
+      updateGate();
+    } else if (t.dataset.date) {
+      const id = t.dataset.id;
+      state.reportDates[id] = state.reportDates[id] || {};
+      state.reportDates[id][t.dataset.date] = t.value;
+    }
+  }
+
+  function setAllReports(on) {
+    state.selected = new Set(on ? REPORTS.map((r) => r.id) : []);
+    document.querySelectorAll("[data-report]").forEach((cb) => {
+      cb.checked = on;
+      const dates = document.querySelector(`[data-dates="${cb.dataset.report}"]`);
+      if (dates) dates.classList.toggle("show", on && state.individualDates);
+    });
+    updateGate();
+  }
+
+  function syncIndividualDateVisibility() {
+    document.querySelectorAll("[data-dates]").forEach((d) => {
+      const id = d.getAttribute("data-dates");
+      d.classList.toggle("show", state.individualDates && state.selected.has(id));
+    });
+    el("applyAllBtn").style.display = state.individualDates ? "" : "none";
+  }
+
+  // Pre-fill any empty per-report date inputs from the master dates so the
+  // fields aren't blank when individual mode is switched on.
+  function prefillIndividualDates() {
+    const start = el("masterStart").value, end = el("masterEnd").value;
+    document.querySelectorAll("[data-date]").forEach((inp) => {
+      if (inp.value) return;
+      inp.value = inp.dataset.date === "start" ? start : end;
+      const id = inp.dataset.id;
+      state.reportDates[id] = state.reportDates[id] || {};
+      state.reportDates[id][inp.dataset.date] = inp.value;
+    });
+  }
+
+  function applyMasterToAll() {
+    const start = el("masterStart").value, end = el("masterEnd").value;
+    document.querySelectorAll("[data-date]").forEach((inp) => {
+      inp.value = inp.dataset.date === "start" ? start : end;
+      const id = inp.dataset.id;
+      state.reportDates[id] = state.reportDates[id] || {};
+      state.reportDates[id][inp.dataset.date] = inp.value;
+    });
+    toast("Master dates applied to every report");
+  }
+
+  // =====================================================================
+  // Gating + summary
+  // =====================================================================
+  function updateGate() {
+    const connected = state.connected || state.demo;
+    const ready = connected && state.selectedTenantId && state.selected.size > 0;
+    el("cardReports").classList.toggle("disabled", !(connected && state.selectedTenantId));
+    el("cardOutput").classList.toggle("disabled", !ready);
+    el("exportBtn").disabled = !ready;
+    el("exportSummary").textContent = state.selected.size
+      ? `${state.selected.size} report${state.selected.size > 1 ? "s" : ""} selected`
+      : "";
+  }
+
+  function updatePackagingLabels() {
+    el("optCombined").textContent = state.format === "pdf" ? "One combined PDF" : "One workbook (sheet per report)";
+  }
+
+  // =====================================================================
+  // Fetch a report (live backend or demo data)
+  // =====================================================================
+  function comparison() {
+    const mode = el("compareMode").value;
+    if (mode === "none") return null;
+    if (mode === "prevPeriod") return { periods: 1, timeframe: "MONTH" };
+    if (mode === "prevYear")  return { periods: 1, timeframe: "YEAR" };
+    return { periods: Math.max(1, Math.min(11, +el("compareCount").value || 1)), timeframe: el("compareTimeframe").value };
+  }
+
+  function paramsFor(report) {
+    const md = { start: el("masterStart").value, end: el("masterEnd").value };
+    const rd = (state.individualDates && state.reportDates[report.id]) || {};
+    const d = { start: rd.start || md.start, end: rd.end || md.end }; // per-field fallback to master
+    const p = {};
+    if (report.dateType === "range") { p.fromDate = d.start; p.toDate = d.end; }
+    else { p.date = d.end; }
+    const cmp = comparison();
+    if (report.periods && cmp) { p.periods = cmp.periods; p.timeframe = cmp.timeframe; }
+    return p;
+  }
+
+  async function fetchReportJson(report) {
+    if (state.demo) {
+      await new Promise((r) => setTimeout(r, 180)); // tiny delay so progress is visible
+      return ReportCore.getDemoReport(report.id);
+    }
+    const qs = new URLSearchParams(Object.assign({ tenantId: state.selectedTenantId, type: report.id }, paramsFor(report)));
+    const r = await fetch(`${API_BASE}/api/report?${qs.toString()}`);
+    const text = await r.text();
+    if (!r.ok) {
+      let msg = `HTTP ${r.status}`;
+      try { const j = JSON.parse(text); msg = j.error || (j.Detail || msg); } catch (_) {}
+      throw new Error(msg);
+    }
+    return JSON.parse(text);
+  }
+
+  // =====================================================================
+  // Rendering — shared with the Node render-test harness via report-render.js,
+  // so the PDF/Excel layout that ships is exactly what gets verified headlessly.
+  // =====================================================================
+  let _renderer = null;
+  function renderer() {
+    if (!_renderer) {
+      _renderer = ReportRender.createRenderer({
+        jsPDF: window.jspdf.jsPDF, XLSX: window.XLSX, JSZip: window.JSZip, ReportCore: window.ReportCore,
+      });
+    }
+    return _renderer;
+  }
+  function xlsxBlob(wb) {
+    return new Blob([renderer().xlsxWrite(wb)], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  }
+
+  // =====================================================================
+  // Download helpers
+  // =====================================================================
+  function download(blob, filename) {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  }
+  const safe = (s) => String(s).replace(/[^\w.\-]+/g, "_").replace(/^_+|_+$/g, "");
+
+  // =====================================================================
+  // Export orchestration
+  // =====================================================================
+  function logReset() { const l = el("log"); l.innerHTML = ""; l.classList.add("show"); }
+  function logLine(msg, cls) {
+    const d = document.createElement("div");
+    d.className = "log-line" + (cls ? " " + cls : "");
+    d.innerHTML = (cls === "ok" ? "✓ " : cls === "err" ? "✗ " : `<span class="spin"></span>`) + `<span>${msg}</span>`;
+    el("log").appendChild(d);
+    el("log").scrollTop = el("log").scrollHeight;
+    return d;
+  }
+
+  async function runExport() {
+    if (!window.jspdf || !window.XLSX || !window.JSZip || !window.ReportRender || !window.ReportCore) { toast("Export libraries are still loading — try again in a moment."); return; }
+    const chosen = REPORTS.filter((r) => state.selected.has(r.id));
+    if (!chosen.length) return;
+
+    // Validate dates
+    for (const r of chosen) {
+      const p = paramsFor(r);
+      if (r.dateType === "range" && (!p.fromDate || !p.toDate)) { toast(`Set From/To dates for ${r.name}`); return; }
+      if (r.dateType === "asAt" && !p.date) { toast(`Set the as-at date for ${r.name}`); return; }
+    }
+
+    const btn = el("exportBtn"); btn.disabled = true; const label = btn.textContent; btn.textContent = "Working…";
+    logReset();
+
+    const results = [];
+    for (const r of chosen) {
+      const line = logLine(`Fetching ${r.name}…`);
+      try {
+        const json = await fetchReportJson(r);
+        results.push({ report: r, normalized: ReportCore.parseReport(json) });
+        line.className = "log-line ok"; line.innerHTML = `✓ <span>${r.name}</span>`;
+      } catch (e) {
+        line.className = "log-line err"; line.innerHTML = `✗ <span>${r.name} — ${e.message}</span>`;
+      }
+    }
+
+    if (!results.length) { toast("No reports could be generated."); btn.disabled = false; btn.textContent = label; return; }
+
+    const R = renderer();
+    const org = (state.tenants.find((t) => t.tenantId === state.selectedTenantId) || {}).tenantName || "Xero";
+    const tag = el("masterEnd").value || iso(new Date());
+    try {
+      if (state.format === "pdf") {
+        if (state.packaging === "combined") {
+          download(R.combinedPdf(results, org).output("blob"), `${safe(org)}_Reports_${tag}.pdf`);
+        } else {
+          const zip = new JSZip();
+          for (const x of results) zip.file(`${safe(org)}_${safe(x.report.name)}_${tag}.pdf`, R.singlePdf(x.normalized, org).output("blob"));
+          download(await zip.generateAsync({ type: "blob" }), `${safe(org)}_Reports_${tag}.zip`);
+        }
+      } else {
+        if (state.packaging === "combined") {
+          download(xlsxBlob(R.workbookFor(results)), `${safe(org)}_Reports_${tag}.xlsx`);
+        } else {
+          const zip = new JSZip();
+          for (const x of results) zip.file(`${safe(org)}_${safe(x.report.name)}_${tag}.xlsx`, xlsxBlob(R.workbookFor([x])));
+          download(await zip.generateAsync({ type: "blob" }), `${safe(org)}_Reports_${tag}.zip`);
+        }
+      }
+      logLine(`Downloaded ${results.length} report${results.length > 1 ? "s" : ""}.`, "ok");
+      toast("Download ready");
+    } catch (e) {
+      logLine(`Failed to build the download: ${e.message}`, "err");
+    }
+    btn.disabled = false; btn.textContent = label;
+  }
+
+  // =====================================================================
+  // Demo mode
+  // =====================================================================
+  function setDemo(on) {
+    state.demo = on;
+    if (on) {
+      state.tenants = ReportCore.DEMO_TENANTS.slice();
+      renderOrgList();
+      el("configBanner").style.display = "none";
+    } else {
+      state.tenants = []; state.selectedTenantId = null;
+      el("orgName").textContent = "Select an organisation";
+      el("orgMeta").textContent = "No organisation selected";
+      el("orgAvatar").textContent = "–"; el("orgAvatar").style.background = "#b6c2cd";
+      renderOrgList();
+    }
+    renderConnection();
+    if (!on) refreshStatus();
+  }
+
+  // =====================================================================
+  // Wire-up
+  // =====================================================================
+  function init() {
+    // default dates
+    const today = new Date();
+    el("masterEnd").value = iso(today);
+    el("masterStart").value = financialYearStart(today);
+
+    buildReportList();
+    updatePackagingLabels();
+
+    el("connectBtn").addEventListener("click", () => { window.location.href = `${API_BASE}/auth/login`; });
+    el("logoutBtn").addEventListener("click", async () => {
+      await fetch(`${API_BASE}/auth/logout`, { method: "POST" });
+      state.connected = false; state.tenants = []; state.selectedTenantId = null;
+      el("orgName").textContent = "Select an organisation"; el("orgMeta").textContent = "No organisation selected";
+      renderConnection(); renderOrgList(); toast("Disconnected from Xero");
+    });
+
+    el("demoToggle").addEventListener("change", (e) => setDemo(e.target.checked));
+
+    // Org switcher
+    el("orgTrigger").addEventListener("click", () => el("org").classList.contains("open") ? closeOrg() : openOrg());
+    el("orgSearch").addEventListener("input", (e) => renderOrgList(e.target.value));
+    document.addEventListener("click", (e) => { if (!el("org").contains(e.target)) closeOrg(); });
+
+    // Dates + comparison
+    el("individualToggle").addEventListener("change", (e) => { state.individualDates = e.target.checked; if (e.target.checked) prefillIndividualDates(); syncIndividualDateVisibility(); });
+    el("applyAllBtn").addEventListener("click", applyMasterToAll);
+    el("compareMode").addEventListener("change", (e) => el("compareCustom").classList.toggle("show", e.target.value === "custom"));
+
+    el("selectAll").addEventListener("click", () => setAllReports(true));
+    el("selectNone").addEventListener("click", () => setAllReports(false));
+
+    // Output options
+    document.querySelectorAll("input[name=format]").forEach((r) => r.addEventListener("change", (e) => { state.format = e.target.value; updatePackagingLabels(); }));
+    document.querySelectorAll("input[name=packaging]").forEach((r) => r.addEventListener("change", (e) => { state.packaging = e.target.value; }));
+    el("exportBtn").addEventListener("click", runExport);
+
+    // toast on return from Xero
+    if (new URLSearchParams(location.search).get("connected") === "1") {
+      toast("Connected to Xero ✓");
+      history.replaceState({}, "", location.pathname);
+    }
+
+    refreshStatus();
+  }
+
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
+  else init();
+})();
+</script>
+</body>
+</html>
