@@ -30,7 +30,7 @@ const {
   XERO_CLIENT_ID,
   XERO_CLIENT_SECRET,
   XERO_REDIRECT_URI = 'http://localhost:3000/callback',
-  XERO_SCOPES = 'openid profile email offline_access accounting.reports.read accounting.settings.read accounting.transactions.read accounting.contacts.read',
+  XERO_SCOPES = 'openid profile email offline_access accounting.reports.read accounting.settings.read',
   PORT = 3000,
   ALLOWED_ORIGIN = '*',
 } = process.env;
@@ -126,13 +126,17 @@ app.get('/auth/login', (req, res) => {
   if (!XERO_CLIENT_ID) return res.status(500).send('Server is missing XERO_CLIENT_ID (see backend/.env).');
   const state = crypto.randomBytes(16).toString('hex');
   pendingStates.add(state);
-  const url = new URL(XERO_AUTHORIZE_URL);
-  url.searchParams.set('response_type', 'code');
-  url.searchParams.set('client_id', XERO_CLIENT_ID);
-  url.searchParams.set('redirect_uri', XERO_REDIRECT_URI);
-  url.searchParams.set('scope', XERO_SCOPES);
-  url.searchParams.set('state', state);
-  res.redirect(url.toString());
+  // Build the query manually so spaces in `scope` are percent-encoded as %20.
+  // (URLSearchParams encodes them as "+", which Xero rejects with invalid_scope.)
+  const params = {
+    response_type: 'code',
+    client_id: XERO_CLIENT_ID,
+    redirect_uri: XERO_REDIRECT_URI,
+    scope: XERO_SCOPES,
+    state,
+  };
+  const qs = Object.entries(params).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
+  res.redirect(`${XERO_AUTHORIZE_URL}?${qs}`);
 });
 
 async function handleCallback(req, res) {
