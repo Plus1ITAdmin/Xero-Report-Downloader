@@ -1,15 +1,12 @@
 /*
  * report-render.js
  * -------------------------------------------------------------------------
- * Turns the normalised models from report-core.js into PDF (jsPDF + autotable)
- * and Excel (SheetJS) that mirror Xero's own exports.
+ * Turns the normalised report model (from report-core.js) into PDF (jsPDF +
+ * autotable) and Excel (SheetJS) that mirror Xero's own export layout.
  *
- * Handles two model kinds:
- *   - financial reports (P&L, Balance Sheet, ...) — portrait, section/row layout
- *   - { kind:'generalledger' } — landscape, grouped-by-account 10-column layout
- *
- * Dependency-injected so the same rendering runs in the browser (window globals)
- * and in Node (require()'d modules), which is how the output is verified.
+ * Dependency-injected so the exact same rendering runs in the browser (passing
+ * window globals) and in Node (passing require()'d modules) — which is how the
+ * output is verified headlessly.
  *
  *   const R = ReportRender.createRenderer({ jsPDF, XLSX, JSZip, ReportCore });
  * -------------------------------------------------------------------------
@@ -23,23 +20,16 @@
   function createRenderer(deps) {
     const { jsPDF, XLSX, JSZip, ReportCore } = deps;
 
-    const fmtShortDate = (d) => (d instanceof Date && !isNaN(d))
-      ? d.toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric' }) : '';
-    // GL number format: thousands + 2dp, negatives in parens, blank for 0/empty.
-    const glNum = (v) => {
-      if (v == null || v === '') return '';
-      const num = Number(v);
-      if (!isFinite(num) || num === 0) return '';
-      const a = Math.abs(num).toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      return num < 0 ? `(${a})` : a;
-    };
-    const orientationFor = (n) => (n && n.kind === 'generalledger' ? 'landscape' : 'portrait');
-    const newDoc = (orientation) => new jsPDF({ unit: 'pt', format: 'a4', orientation: orientation || 'portrait', compress: true });
-    const newPdf = () => newDoc('portrait');
+    // ---- PDF ---------------------------------------------------------------
+    function newPdf() {
+      return new jsPDF({ unit: 'pt', format: 'a4', compress: true });
+    }
 
-    // ---- Financial report body (draws on the current page) -----------------
-    function drawReportBody(doc, n) {
-      const M = 42;
+    /** Render one report onto the doc, starting a new page unless it's first. */
+    function addReportToPdf(doc, n, isFirst) {
+      const M = 42; // page margin (pt)
+      if (!isFirst) doc.addPage();
+
       let y = 58;
       doc.setTextColor(33, 41, 51);
       doc.setFont('helvetica', 'bold');
@@ -78,134 +68,66 @@
             const indent = 8 + (m.depth || 0) * 13 + (m.type === 'row' ? 13 : 0);
             data.cell.styles.cellPadding = { top: 2.6, right: 8, bottom: 2.6, left: indent };
           }
-          if (m.type === 'sectionTitle') { data.cell.styles.fontStyle = 'bold'; data.cell.styles.lineWidth = { bottom: 0.5 }; data.cell.styles.lineColor = [210, 216, 223]; }
-          if (m.type === 'summary') { data.cell.styles.fontStyle = 'bold'; data.cell.styles.lineWidth = { top: 0.5 }; data.cell.styles.lineColor = [150, 160, 170]; }
-        },
-      });
-    }
-
-    // ---- General Ledger body (landscape, grouped by account) ---------------
-    function drawGLBody(doc, n) {
-      const M = 42;
-      let y = 50;
-      doc.setTextColor(33, 41, 51);
-      doc.setFont('helvetica', 'bold');
-      doc.setFontSize(18); doc.text(String(n.titles[0] || 'General Ledger Detail'), M, y); y += 18;
-      doc.setFontSize(11);
-      for (let i = 1; i < n.titles.length; i++) { doc.text(String(n.titles[i]), M, y); y += 14; }
-      y += 6;
-
-      const body = [], meta = [];
-      for (const acc of n.accounts) {
-        body.push([acc.name, '', '', '', '', '', '', '', '', '']); meta.push('account');
-        for (const ln of acc.lines) {
-          body.push([
-            fmtShortDate(ln.date), ln.source, ln.description, ln.reference,
-            glNum(ln.debit), glNum(ln.credit), glNum(ln.runningBalance),
-            glNum(ln.gst), ln.gstRate ? `${ln.gstRate}%` : '', ln.gstRateName,
-          ]);
-          meta.push('row');
-        }
-        body.push([`Total ${acc.name}`, '', '', '', glNum(acc.totalDebit), glNum(acc.totalCredit), '', '', '', '']); meta.push('total');
-        const nd = acc.net >= 0 ? acc.net : null, nc = acc.net < 0 ? -acc.net : null;
-        body.push(['Net movement', '', '', '', glNum(nd), glNum(nc), '', '', '', '']); meta.push('net');
-        body.push(['', '', '', '', '', '', '', '', '', '']); meta.push('spacer');
-      }
-
-      doc.autoTable({
-        head: [n.columns], body, startY: y, margin: { left: M, right: M }, theme: 'plain',
-        styles: { font: 'helvetica', fontSize: 7.5, textColor: [40, 48, 58], cellPadding: { top: 1.8, right: 5, bottom: 1.8, left: 5 }, overflow: 'linebreak' },
-        headStyles: { fontStyle: 'bold', fontSize: 7.5, halign: 'left', fillColor: [245, 247, 250], textColor: [70, 80, 92], lineWidth: { bottom: 0.6 }, lineColor: [120, 132, 145] },
-        columnStyles: {
-          0: { cellWidth: 52 }, 1: { cellWidth: 62 }, 2: { cellWidth: 'auto' }, 3: { cellWidth: 78 },
-          4: { halign: 'right', cellWidth: 56 }, 5: { halign: 'right', cellWidth: 56 }, 6: { halign: 'right', cellWidth: 64 },
-          7: { halign: 'right', cellWidth: 44 }, 8: { halign: 'right', cellWidth: 46 }, 9: { cellWidth: 72 },
-        },
-        didParseCell: (data) => {
-          if (data.section === 'head') { if ([4, 5, 6, 7, 8].includes(data.column.index)) data.cell.styles.halign = 'right'; return; }
-          const m = meta[data.row.index];
-          if (!m) return;
-          if (m === 'spacer') { data.cell.styles.minCellHeight = 3; data.cell.styles.fontSize = 3; return; }
-          if (m === 'account') {
+          if (m.type === 'sectionTitle') {
             data.cell.styles.fontStyle = 'bold';
-            if (data.column.index === 0) data.cell.styles.fontSize = 8.5;
-            data.cell.styles.lineWidth = { bottom: 0.4 }; data.cell.styles.lineColor = [210, 216, 223];
+            data.cell.styles.lineWidth = { bottom: 0.5 };
+            data.cell.styles.lineColor = [210, 216, 223];
           }
-          if (m === 'total' || m === 'net') data.cell.styles.fontStyle = 'bold';
-          if (m === 'total' && data.column.index === 0) { data.cell.styles.lineWidth = { top: 0.4 }; data.cell.styles.lineColor = [150, 160, 170]; }
+          if (m.type === 'summary') {
+            data.cell.styles.fontStyle = 'bold';
+            data.cell.styles.lineWidth = { top: 0.5 };
+            data.cell.styles.lineColor = [150, 160, 170];
+          }
         },
       });
     }
-
-    const drawBody = (doc, n) => (n && n.kind === 'generalledger' ? drawGLBody(doc, n) : drawReportBody(doc, n));
 
     function stampPdfFooters(doc, org) {
       const pages = doc.getNumberOfPages();
+      const w = doc.internal.pageSize.getWidth(), h = doc.internal.pageSize.getHeight();
       const today = new Date().toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric' });
       for (let i = 1; i <= pages; i++) {
         doc.setPage(i);
-        const w = doc.internal.pageSize.getWidth(), h = doc.internal.pageSize.getHeight();
         doc.setFont('helvetica', 'normal'); doc.setFontSize(8); doc.setTextColor(150, 160, 170);
         doc.text(`${org}   ·   ${today}`, 42, h - 24);
         doc.text(`Page ${i} of ${pages}`, w - 42, h - 24, { align: 'right' });
       }
     }
 
+    /** Build a combined PDF (one report per page) and return the jsPDF doc. */
     function combinedPdf(results, org) {
-      const doc = newDoc(orientationFor(results[0].normalized));
-      results.forEach((x, i) => {
-        if (i > 0) doc.addPage('a4', orientationFor(x.normalized));
-        drawBody(doc, x.normalized);
-      });
+      const doc = newPdf();
+      results.forEach((x, i) => addReportToPdf(doc, x.normalized, i === 0));
       stampPdfFooters(doc, org);
       return doc;
     }
+    /** Build a single-report PDF and return the jsPDF doc. */
     function singlePdf(normalized, org) {
-      const doc = newDoc(orientationFor(normalized));
-      drawBody(doc, normalized);
+      const doc = newPdf();
+      addReportToPdf(doc, normalized, true);
       stampPdfFooters(doc, org);
       return doc;
     }
 
     // ---- Excel -------------------------------------------------------------
-    function applyColWidths(ws, aoa) {
-      let maxCols = 0;
-      aoa.forEach((row) => { maxCols = Math.max(maxCols, row.length); });
-      const widths = [];
-      for (let c = 0; c < maxCols; c++) {
-        let w = 10;
-        aoa.forEach((row) => { const v = row[c]; if (v != null && v !== '') w = Math.max(w, String(v).length + 2); });
-        widths.push({ wch: Math.min(w, 50) });
-      }
-      ws['!cols'] = widths;
-    }
-
-    function reportWorksheet(n) {
+    function worksheetFor(n) {
       const { aoa, numberCells } = ReportCore.buildAOA(n);
       const ws = XLSX.utils.aoa_to_sheet(aoa);
       for (const { r, c } of numberCells) {
         const ref = XLSX.utils.encode_cell({ r, c });
         if (ws[ref]) ws[ref].z = ReportCore.EXCEL_NUM_FMT;
       }
-      applyColWidths(ws, aoa);
-      return ws;
-    }
-
-    function glWorksheet(n) {
-      const { aoa, dateCells } = ReportCore.glToAOA(n);
-      const ws = XLSX.utils.aoa_to_sheet(aoa);
-      // Numbers keep Excel's General format (like Xero's GL export): 0 shows as
-      // "0" and values keep their natural precision. Only dates get a format.
-      for (const { r, c } of dateCells) {
-        const ref = XLSX.utils.encode_cell({ r, c });
-        if (ws[ref]) { ws[ref].t = 'n'; ws[ref].z = 'd mmm yyyy'; }
+      let maxCols = 0;
+      aoa.forEach((row) => { maxCols = Math.max(maxCols, row.length); });
+      const widths = [];
+      for (let c = 0; c < maxCols; c++) {
+        let w = 10;
+        aoa.forEach((row) => { const v = row[c]; if (v != null && v !== '') w = Math.max(w, String(v).length + 2); });
+        widths.push({ wch: Math.min(w, 48) });
       }
-      // GL has 10 fixed columns — give them sensible fixed widths.
-      ws['!cols'] = [12, 14, 40, 20, 13, 13, 15, 11, 9, 18].map((wch) => ({ wch }));
+      ws['!cols'] = widths;
       return ws;
     }
-
-    const worksheetFor = (n) => (n && n.kind === 'generalledger' ? glWorksheet(n) : reportWorksheet(n));
 
     function workbookFor(results) {
       const wb = XLSX.utils.book_new();
@@ -215,9 +137,17 @@
       }
       return wb;
     }
-    const xlsxWrite = (wb) => XLSX.write(wb, { type: 'array', bookType: 'xlsx' });
 
-    return { JSZip, newPdf, stampPdfFooters, combinedPdf, singlePdf, worksheetFor, workbookFor, xlsxWrite };
+    /** Return the .xlsx bytes (Uint8Array); caller wraps in Blob or Buffer. */
+    function xlsxWrite(wb) {
+      return XLSX.write(wb, { type: 'array', bookType: 'xlsx' });
+    }
+
+    return {
+      JSZip,
+      newPdf, addReportToPdf, stampPdfFooters, combinedPdf, singlePdf,
+      worksheetFor, workbookFor, xlsxWrite,
+    };
   }
 
   return { createRenderer };
