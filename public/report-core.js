@@ -197,6 +197,143 @@
   }
 
   // ---------------------------------------------------------------------------
+  // General Ledger Detail — built from the Journals API (not a /Reports endpoint)
+  // ---------------------------------------------------------------------------
+  const SOURCE_TYPES = {
+    ACCREC: 'Sales Invoice', ACCPAY: 'Bill',
+    ACCRECCREDIT: 'Sales Credit Note', ACCPAYCREDIT: 'Bill Credit Note',
+    ACCRECPAYMENT: 'Sales Payment', ACCPAYPAYMENT: 'Bill Payment',
+    ARCREDITPAYMENT: 'Sales Credit Note Refund', APCREDITPAYMENT: 'Bill Credit Note Refund',
+    CASHREC: 'Receive Money', CASHPAID: 'Spend Money',
+    TRANSFER: 'Bank Transfer', TRANSFERPAYMENT: 'Bank Transfer',
+    ARPREPAYMENT: 'Sales Prepayment', APPREPAYMENT: 'Bill Prepayment',
+    AROVERPAYMENT: 'Sales Overpayment', APOVERPAYMENT: 'Bill Overpayment',
+    EXPCLAIM: 'Expense Claim', EXPPAYMENT: 'Expense Claim Payment',
+    MANJOURNAL: 'Manual Journal', PAYSLIP: 'Payslip', WAGEPAYABLE: 'Wage Payable',
+    INTEGRATEDPAYROLLPE: 'Payroll', INTEGRATEDPAYROLLPT: 'Payroll Payment',
+    INTEGRATEDPAYROLLPTPAYMENT: 'Payroll Payment', EXTERNALSPENDMONEY: 'Spend Money',
+  };
+  function mapSource(t) {
+    if (!t) return '';
+    if (SOURCE_TYPES[t]) return SOURCE_TYPES[t];
+    return String(t).toLowerCase().replace(/(^|\s)\S/g, (c) => c.toUpperCase());
+  }
+
+  function parseJournalDate(s) {
+    if (!s) return null;
+    const m = /\/Date\((-?\d+)/.exec(String(s));
+    return m ? new Date(parseInt(m[1], 10)) : new Date(s);
+  }
+  function isoToLocalDate(s) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(s || ''));
+    return m ? new Date(+m[1], +m[2] - 1, +m[3]) : (s ? new Date(s) : null);
+  }
+  function excelDateSerial(d) {
+    if (!(d instanceof Date) || isNaN(d)) return '';
+    const epoch = Date.UTC(1899, 11, 30);
+    const day = Date.UTC(d.getFullYear(), d.getMonth(), d.getDate());
+    return Math.round((day - epoch) / 86400000);
+  }
+  function fmtLongDate(d) {
+    return d instanceof Date && !isNaN(d)
+      ? d.toLocaleDateString('en-AU', { day: 'numeric', month: 'long', year: 'numeric' })
+      : '';
+  }
+  const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
+
+  const GL_COLUMNS = ['Date', 'Source', 'Description', 'Reference', 'Debit', 'Credit', 'Running Balance', 'GST', 'GST Rate', 'GST Rate Name'];
+
+  /**
+   * Build a General Ledger Detail model from a Journals API response.
+   * opts: { orgName, fromDate, toDate }  (dates ISO yyyy-mm-dd)
+   */
+  function buildGeneralLedger(journalsResponse, opts) {
+    const o = opts || {};
+    const journals = (journalsResponse && journalsResponse.Journals) || [];
+    const accounts = new Map();
+
+    for (const j of journals) {
+      const date = parseJournalDate(j.JournalDate);
+      const source = mapSource(j.SourceType);
+      const reference = j.Reference || '';
+      for (const line of (j.JournalLines || [])) {
+        const net = Number(line.NetAmount) || 0;
+        const tax = Number(line.TaxAmount) || 0;
+        const key = line.AccountID || `${line.AccountCode || ''}|${line.AccountName || ''}`;
+        if (!accounts.has(key)) {
+          accounts.set(key, { name: line.AccountName || '(No account)', code: line.AccountCode || '', lines: [] });
+        }
+        accounts.get(key).lines.push({
+          date, journalNumber: j.JournalNumber || 0, source,
+          description: line.Description || '',
+          reference,
+          debit: net > 0 ? net : null,
+          credit: net < 0 ? -net : null,
+          gst: tax ? round2(Math.abs(tax)) : 0,
+          gstRate: net !== 0 ? round2(Math.abs(tax / net) * 100) : 0,
+          gstRateName: line.TaxName || '',
+        });
+      }
+    }
+
+    const list = [...accounts.values()];
+    for (const acc of list) {
+      acc.lines.sort((a, b) => (a.date - b.date) || (a.journalNumber - b.journalNumber));
+      let bal = 0, td = 0, tc = 0;
+      for (const ln of acc.lines) {
+        bal += (ln.debit || 0) - (ln.credit || 0);
+        ln.runningBalance = round2(bal);
+        td += ln.debit || 0; tc += ln.credit || 0;
+      }
+      acc.totalDebit = round2(td);
+      acc.totalCredit = round2(tc);
+      acc.net = round2(td - tc);
+    }
+    list.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+
+    const fromD = isoToLocalDate(o.fromDate), toD = isoToLocalDate(o.toDate);
+    const period = (fromD && toD) ? `For the period ${fmtLongDate(fromD)} to ${fmtLongDate(toD)}` : '';
+    return {
+      kind: 'generalledger',
+      reportName: 'General Ledger Detail',
+      titles: ['General Ledger Detail', o.orgName || '', period].filter(Boolean),
+      columns: GL_COLUMNS.slice(),
+      accounts: list,
+    };
+  }
+
+  /** GL model -> array-of-arrays for Excel, mirroring Xero's GL Detail layout. */
+  function glToAOA(gl) {
+    const aoa = [], dateCells = [], numberCells = [];
+    for (const t of gl.titles) aoa.push([t]);
+    aoa.push([]);
+    aoa.push(gl.columns.slice());
+    for (const acc of gl.accounts) {
+      aoa.push([acc.name]);
+      for (const ln of acc.lines) {
+        const r = aoa.length;
+        const serial = excelDateSerial(ln.date);
+        aoa.push([
+          serial, ln.source, ln.description, ln.reference,
+          ln.debit != null ? ln.debit : 0, ln.credit != null ? ln.credit : 0,
+          ln.runningBalance, ln.gst || 0, ln.gstRate || 0, ln.gstRateName,
+        ]);
+        if (serial !== '') dateCells.push({ r, c: 0 });
+        [4, 5, 6, 7, 8].forEach((c) => numberCells.push({ r, c }));
+      }
+      const rt = aoa.length;
+      aoa.push([`Total ${acc.name}`, '', '', '', acc.totalDebit, acc.totalCredit, '', '', '', '']);
+      numberCells.push({ r: rt, c: 4 }, { r: rt, c: 5 });
+      const rn = aoa.length;
+      const nd = acc.net >= 0 ? acc.net : 0, nc = acc.net < 0 ? round2(-acc.net) : 0;
+      aoa.push(['Net movement', '', '', '', nd, nc, '', '', '', '']);
+      numberCells.push({ r: rn, c: 4 }, { r: rn, c: 5 });
+      aoa.push([]);
+    }
+    return { aoa, dateCells, numberCells };
+  }
+
+  // ---------------------------------------------------------------------------
   // Demo data — realistic Xero-shaped responses so the whole pipeline (select →
   // dates → render → download) works before any backend / Xero connection.
   // ---------------------------------------------------------------------------
@@ -349,17 +486,50 @@
     { tenantId: 'demo-tenant-003', tenantName: 'Riverside Cafe Trust', tenantType: 'ORGANISATION' },
   ];
 
+  // Synthetic journals so Demo mode can render a General Ledger in the right shape.
+  const DEMO_JOURNALS = (function () {
+    let n = 1000; const J = [];
+    const ms = (y, mo, d) => `/Date(${Date.UTC(y, mo - 1, d)}+0000)/`;
+    function spend(y, mo, d, account, code, net, ratePct, desc, ref) {
+      const tax = round2(net * ratePct / 100);
+      J.push({
+        JournalNumber: n++, JournalDate: ms(y, mo, d), SourceType: 'CASHPAID', Reference: ref || '',
+        JournalLines: [
+          { AccountCode: code, AccountName: account, Description: desc, NetAmount: net, TaxAmount: tax, TaxName: ratePct ? 'GST on Expenses' : 'GST Free Expenses' },
+          { AccountCode: '090', AccountName: 'Business Bank Account', Description: desc, NetAmount: -round2(net + tax), TaxAmount: 0, TaxName: '' },
+        ],
+      });
+    }
+    spend(2025, 8, 12, 'Accounting Fees', '404', 723.34, 10, 'Unknown - CHEQUE 0000722', '0000722');
+    spend(2025, 10, 3, 'Accounting Fees', '404', 181.82, 10, 'Vicpass - CHEQUE 0000730', '');
+    spend(2025, 11, 18, 'Accounting Fees', '404', 651.67, 10, 'Vicpass - CHEQUE 0000730', '');
+    spend(2026, 2, 9, 'Accounting Fees', '404', 1219.98, 10, 'Unknown - CHEQUE 0000750', '0000750- Vicpass');
+    spend(2025, 7, 30, 'Bank Fees', '402', 10.00, 0, 'Unknown - ACCOUNT FEES', 'ACCOUNT FEES');
+    spend(2025, 9, 30, 'Bank Fees', '402', 40.00, 0, 'Service fee', 'SERVICE FEE');
+    spend(2025, 12, 31, 'Bank Fees', '402', 12.00, 0, 'Unknown - BANK CHQ ISSUE FEE', '');
+    spend(2025, 7, 5, 'Fuel & Lubricants', '449', 168.20, 10, 'Unknown - Fuel & Lubricants', 'PETROGAS');
+    spend(2025, 7, 8, 'Fuel & Lubricants', '449', 59.50, 10, 'Unknown - Fuel & Lubricants', 'LIBERTY');
+    spend(2025, 7, 11, 'Fuel & Lubricants', '449', 51.40, 10, 'Unknown - Fuel & Lubricants', 'LIBERTY');
+    return { Journals: J };
+  })();
+
   const getDemoReport = (type) => DEMO[type] || DEMO.ProfitAndLoss;
 
   return {
     EXCEL_NUM_FMT,
+    GL_COLUMNS,
     parseReport,
     buildAOA,
     toNumberOrString,
     formatAmount,
     sanitizeSheetName,
+    mapSource,
+    excelDateSerial,
+    buildGeneralLedger,
+    glToAOA,
     getDemoReport,
     DEMO,
     DEMO_TENANTS,
+    DEMO_JOURNALS,
   };
 }));

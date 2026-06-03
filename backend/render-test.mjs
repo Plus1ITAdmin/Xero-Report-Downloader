@@ -38,6 +38,17 @@ const wb = R.workbookFor(results);
 const xlsxPath = path.join(outDir, 'sample-combined.xlsx');
 fs.writeFileSync(xlsxPath, Buffer.from(R.xlsxWrite(wb)));
 
+// General Ledger Detail (landscape PDF + Excel) from synthetic journals.
+const gl = ReportCore.buildGeneralLedger(ReportCore.DEMO_JOURNALS, { orgName: 'Demo Company (AU)', fromDate: '2025-07-01', toDate: '2026-06-30' });
+const glDoc = R.singlePdf(gl, 'Demo Company (AU)');
+const glPdfPath = path.join(outDir, 'sample-gl.pdf');
+fs.writeFileSync(glPdfPath, Buffer.from(glDoc.output('arraybuffer')));
+const glWb = R.workbookFor([{ normalized: gl }]);
+const glXlsxPath = path.join(outDir, 'sample-gl.xlsx');
+fs.writeFileSync(glXlsxPath, Buffer.from(R.xlsxWrite(glWb)));
+
 console.log('Wrote', pdfPath);
 console.log('Wrote', xlsxPath);
+console.log('Wrote', glPdfPath, `(${glDoc.getNumberOfPages()} page, ${gl.accounts.length} accounts)`);
+console.log('Wrote', glXlsxPath);
 console.log('PDF pages:', doc.getNumberOfPages(), '· Workbook sheets:', wb.SheetNames.join(', '));
