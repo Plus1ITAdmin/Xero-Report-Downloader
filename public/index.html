@@ -168,12 +168,13 @@
       <div class="step-head"><span class="step-num">1</span><h2>Connect to Xero</h2></div>
       <div class="conn-row">
         <button class="btn-primary" id="connectBtn">Connect to Xero</button>
+        <button class="btn-ghost" id="addClientBtn" style="display:none">+ Add a client</button>
         <span class="pill" id="connPill"><span class="dot"></span><span id="connText">Not connected</span></span>
         <button class="btn-link" id="logoutBtn" style="display:none">Disconnect</button>
       </div>
       <div class="conn-note">
-        You'll be redirected to Xero to sign in and authorise access. Authorise each client organisation once —
-        they'll then appear in the dropdown below.
+        <b>Connect to Xero</b> loads the clients you've already connected — no need to pick one each time.
+        <b>+ Add a client</b> takes you to Xero to authorise a new organisation, which then joins the dropdown.
       </div>
     </section>
 
@@ -353,12 +354,34 @@
     }
   }
 
+  // "Connect to Xero": if the backend already holds a (persisted) authorisation,
+  // just load the connected clients — no Xero redirect, no org picking. Only the
+  // very first time (no saved token) does it send you to Xero to authorise.
+  async function smartConnect() {
+    if (state.demo) return;
+    try {
+      const r = await fetch(`${API_BASE}/auth/status`);
+      const s = await r.json();
+      if (s.connected) {
+        state.connected = true;
+        await loadConnections();
+        renderConnection();
+        toast("Connected — your clients are loaded");
+        return;
+      }
+    } catch (_) {}
+    window.location.href = `${API_BASE}/auth/login`; // first-time: authorise
+  }
+
   function renderConnection() {
     const pill = el("connPill"), text = el("connText");
     const connected = state.connected || state.demo;
     pill.classList.toggle("connected", connected);
     text.textContent = state.demo ? "Demo mode" : (connected ? "Connected" : "Not connected");
-    el("connectBtn").style.display = connected ? "none" : "";
+    // "Connect to Xero" stays visible (when already connected it just reloads
+    // your clients, no org picking); "Add a client" + "Disconnect" appear once connected.
+    el("connectBtn").style.display = state.demo ? "none" : "";
+    el("addClientBtn").style.display = (state.connected && !state.demo) ? "" : "none";
     el("logoutBtn").style.display = (state.connected && !state.demo) ? "" : "none";
     el("cardClient").classList.toggle("disabled", !connected);
     updateGate();
@@ -675,7 +698,8 @@
     buildReportList();
     updatePackagingLabels();
 
-    el("connectBtn").addEventListener("click", () => { window.location.href = `${API_BASE}/auth/login`; });
+    el("connectBtn").addEventListener("click", smartConnect);
+    el("addClientBtn").addEventListener("click", () => { window.location.href = `${API_BASE}/auth/login`; });
     el("logoutBtn").addEventListener("click", async () => {
       await fetch(`${API_BASE}/auth/logout`, { method: "POST" });
       state.connected = false; state.tenants = []; state.selectedTenantId = null;
