@@ -197,6 +197,186 @@
   }
 
   // ---------------------------------------------------------------------------
+  // General Ledger Detail — built from the Journals API (not a /Reports endpoint)
+  // ---------------------------------------------------------------------------
+  const SOURCE_TYPES = {
+    ACCREC: 'Sales Invoice', ACCPAY: 'Bill',
+    ACCRECCREDIT: 'Sales Credit Note', ACCPAYCREDIT: 'Bill Credit Note',
+    ACCRECPAYMENT: 'Sales Payment', ACCPAYPAYMENT: 'Bill Payment',
+    ARCREDITPAYMENT: 'Sales Credit Note Refund', APCREDITPAYMENT: 'Bill Credit Note Refund',
+    CASHREC: 'Receive Money', CASHPAID: 'Spend Money',
+    TRANSFER: 'Bank Transfer', TRANSFERPAYMENT: 'Bank Transfer',
+    ARPREPAYMENT: 'Sales Prepayment', APPREPAYMENT: 'Bill Prepayment',
+    AROVERPAYMENT: 'Sales Overpayment', APOVERPAYMENT: 'Bill Overpayment',
+    EXPCLAIM: 'Expense Claim', EXPPAYMENT: 'Expense Claim Payment',
+    MANJOURNAL: 'Manual Journal', PAYSLIP: 'Payslip', WAGEPAYABLE: 'Wage Payable',
+    INTEGRATEDPAYROLLPE: 'Payroll', INTEGRATEDPAYROLLPT: 'Payroll Payment',
+    INTEGRATEDPAYROLLPTPAYMENT: 'Payroll Payment', EXTERNALSPENDMONEY: 'Spend Money',
+  };
+  function mapSource(t) {
+    if (!t) return '';
+    if (SOURCE_TYPES[t]) return SOURCE_TYPES[t];
+    return String(t).toLowerCase().replace(/(^|\s)\S/g, (c) => c.toUpperCase());
+  }
+
+  function parseJournalDate(s) {
+    if (!s) return null;
+    const m = /\/Date\((-?\d+)/.exec(String(s));
+    return m ? new Date(parseInt(m[1], 10)) : new Date(s);
+  }
+  function isoToLocalDate(s) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(s || ''));
+    return m ? new Date(+m[1], +m[2] - 1, +m[3]) : (s ? new Date(s) : null);
+  }
+  function excelDateSerial(d) {
+    if (!(d instanceof Date) || isNaN(d)) return '';
+    const epoch = Date.UTC(1899, 11, 30);
+    const day = Date.UTC(d.getFullYear(), d.getMonth(), d.getDate());
+    return Math.round((day - epoch) / 86400000);
+  }
+  function fmtLongDate(d) {
+    return d instanceof Date && !isNaN(d)
+      ? d.toLocaleDateString('en-AU', { day: 'numeric', month: 'long', year: 'numeric' })
+      : '';
+  }
+  const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
+
+  const GL_COLUMNS = ['Date', 'Source', 'Description', 'Reference', 'Debit', 'Credit', 'Running Balance', 'GST', 'GST Rate', 'GST Rate Name'];
+
+  /**
+   * Build a General Ledger Detail model from sub-ledger data (the Journals API
+   * needs a premium plan). `data` = { Accounts, TaxRates, BankTransactions,
+   * Invoices, ManualJournals }. opts: { orgName, fromDate, toDate }.
+   *
+   * Every line item posts directly to its income/expense account; balance-sheet
+   * control accounts (bank, AR/AP, GST) are system-generated and not included.
+   */
+  function buildGeneralLedger(data, opts) {
+    const o = opts || {};
+    data = data || {};
+    const accountName = {};
+    for (const a of (data.Accounts || [])) accountName[a.Code] = a.Name;
+    const taxMap = {};
+    for (const t of (data.TaxRates || [])) {
+      taxMap[t.TaxType] = { name: t.Name, rate: t.EffectiveRate != null ? Number(t.EffectiveRate) : (t.DisplayTaxRate != null ? Number(t.DisplayTaxRate) : 0) };
+    }
+    const accounts = new Map();
+    let seq = 0;
+
+    function add(code, fallbackName, e) {
+      const key = code || fallbackName || '(No account)';
+      if (!accounts.has(key)) accounts.set(key, { name: accountName[code] || fallbackName || code || '(No account)', code: code || '', lines: [] });
+      e.seq = seq++;
+      accounts.get(key).lines.push(e);
+    }
+    function netTax(line, lineAmountTypes) {
+      const amt = Number(line.LineAmount) || 0, tax = Number(line.TaxAmount) || 0;
+      return { net: lineAmountTypes === 'Inclusive' ? round2(amt - tax) : amt, tax };
+    }
+    function postLines(lines, lineAmountTypes, meta) {
+      for (const line of (lines || [])) {
+        const code = line.AccountCode;
+        if (!code) continue;
+        const { net, tax } = netTax(line, lineAmountTypes);
+        const value = round2(net * meta.sign);
+        const tm = taxMap[line.TaxType] || {};
+        const desc = meta.contact ? meta.contact + (line.Description ? ' - ' + line.Description : '') : (line.Description || '');
+        add(code, line.AccountName, {
+          date: meta.date, source: meta.source, description: desc, reference: meta.reference || '',
+          debit: value > 0 ? value : null, credit: value < 0 ? round2(-value) : null,
+          gst: tax ? round2(Math.abs(tax)) : 0,
+          gstRate: tm.rate != null ? tm.rate : (net ? round2(Math.abs(tax / net) * 100) : 0),
+          gstRateName: tm.name || line.TaxType || '',
+        });
+      }
+    }
+
+    // Bank transactions: SPEND -> debit expense, RECEIVE -> credit income.
+    for (const bt of (data.BankTransactions || [])) {
+      const isSpend = String(bt.Type || '').indexOf('SPEND') === 0;
+      postLines(bt.LineItems, bt.LineAmountTypes, {
+        date: parseJournalDate(bt.Date), source: isSpend ? 'Spend Money' : 'Receive Money',
+        reference: bt.Reference, contact: (bt.Contact && bt.Contact.Name) || 'Unknown', sign: isSpend ? 1 : -1,
+      });
+    }
+    // Invoices: ACCPAY (bill) -> debit expense, ACCREC (sales) -> credit income.
+    for (const inv of (data.Invoices || [])) {
+      const isBill = inv.Type === 'ACCPAY';
+      postLines(inv.LineItems, inv.LineAmountTypes, {
+        date: parseJournalDate(inv.Date), source: isBill ? 'Bill' : 'Sales Invoice',
+        reference: inv.Reference || inv.InvoiceNumber || '', contact: (inv.Contact && inv.Contact.Name) || '', sign: isBill ? 1 : -1,
+      });
+    }
+    // Manual journals: LineAmount sign sets debit/credit.
+    for (const mj of (data.ManualJournals || [])) {
+      const date = parseJournalDate(mj.Date);
+      for (const line of (mj.JournalLines || [])) {
+        if (!line.AccountCode) continue;
+        const amt = Number(line.LineAmount) || 0, tax = Number(line.TaxAmount) || 0;
+        const tm = taxMap[line.TaxType] || {};
+        add(line.AccountCode, line.AccountName, {
+          date, source: 'Manual Journal', description: line.Description || mj.Narration || '', reference: '',
+          debit: amt > 0 ? amt : null, credit: amt < 0 ? round2(-amt) : null,
+          gst: tax ? round2(Math.abs(tax)) : 0,
+          gstRate: tm.rate != null ? tm.rate : 0, gstRateName: tm.name || line.TaxType || '',
+        });
+      }
+    }
+
+    const list = [...accounts.values()];
+    for (const acc of list) {
+      acc.lines.sort((a, b) => (a.date - b.date) || (a.seq - b.seq));
+      let bal = 0, td = 0, tc = 0;
+      for (const ln of acc.lines) {
+        bal += (ln.debit || 0) - (ln.credit || 0);
+        ln.runningBalance = round2(bal);
+        td += ln.debit || 0; tc += ln.credit || 0;
+      }
+      acc.totalDebit = round2(td); acc.totalCredit = round2(tc); acc.net = round2(td - tc);
+    }
+    list.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+
+    const fromD = isoToLocalDate(o.fromDate), toD = isoToLocalDate(o.toDate);
+    const period = (fromD && toD) ? `For the period ${fmtLongDate(fromD)} to ${fmtLongDate(toD)}` : '';
+    return {
+      kind: 'generalledger', reportName: 'General Ledger Detail',
+      titles: ['General Ledger Detail', o.orgName || '', period].filter(Boolean),
+      columns: GL_COLUMNS.slice(), accounts: list,
+    };
+  }
+
+  /** GL model -> array-of-arrays for Excel, mirroring Xero's GL Detail layout. */
+  function glToAOA(gl) {
+    const aoa = [], dateCells = [], numberCells = [];
+    for (const t of gl.titles) aoa.push([t]);
+    aoa.push([]);
+    aoa.push(gl.columns.slice());
+    for (const acc of gl.accounts) {
+      aoa.push([acc.name]);
+      for (const ln of acc.lines) {
+        const r = aoa.length;
+        const serial = excelDateSerial(ln.date);
+        aoa.push([
+          serial, ln.source, ln.description, ln.reference,
+          ln.debit != null ? ln.debit : 0, ln.credit != null ? ln.credit : 0,
+          ln.runningBalance, ln.gst || 0, ln.gstRate || 0, ln.gstRateName,
+        ]);
+        if (serial !== '') dateCells.push({ r, c: 0 });
+        [4, 5, 6, 7, 8].forEach((c) => numberCells.push({ r, c }));
+      }
+      const rt = aoa.length;
+      aoa.push([`Total ${acc.name}`, '', '', '', acc.totalDebit, acc.totalCredit, '', '', '', '']);
+      numberCells.push({ r: rt, c: 4 }, { r: rt, c: 5 });
+      const rn = aoa.length;
+      const nd = acc.net >= 0 ? acc.net : 0, nc = acc.net < 0 ? round2(-acc.net) : 0;
+      aoa.push(['Net movement', '', '', '', nd, nc, '', '', '', '']);
+      numberCells.push({ r: rn, c: 4 }, { r: rn, c: 5 });
+      aoa.push([]);
+    }
+    return { aoa, dateCells, numberCells };
+  }
+
+  // ---------------------------------------------------------------------------
   // Demo data — realistic Xero-shaped responses so the whole pipeline (select →
   // dates → render → download) works before any backend / Xero connection.
   // ---------------------------------------------------------------------------
@@ -349,17 +529,54 @@
     { tenantId: 'demo-tenant-003', tenantName: 'Riverside Cafe Trust', tenantType: 'ORGANISATION' },
   ];
 
+  // Synthetic sub-ledger data so Demo mode can render a General Ledger.
+  const DEMO_SUBLEDGERS = (function () {
+    const ms = (y, mo, d) => `/Date(${Date.UTC(y, mo - 1, d)}+0000)/`;
+    const BankTransactions = [];
+    function spend(y, mo, d, code, net, taxType, rate, desc, ref, contact) {
+      BankTransactions.push({
+        Type: 'SPEND', Status: 'AUTHORISED', Date: ms(y, mo, d), Reference: ref || '', LineAmountTypes: 'Exclusive',
+        Contact: contact ? { Name: contact } : undefined,
+        LineItems: [{ AccountCode: code, Description: desc, LineAmount: net, TaxType: taxType, TaxAmount: round2(net * rate / 100) }],
+      });
+    }
+    spend(2025, 8, 12, '404', 723.34, 'INPUT', 10, 'CHEQUE 0000722', '0000722', null);
+    spend(2025, 10, 3, '404', 181.82, 'INPUT', 10, 'CHEQUE 0000730', '', 'Vicpass');
+    spend(2025, 11, 18, '404', 651.67, 'INPUT', 10, 'CHEQUE 0000730', '', 'Vicpass');
+    spend(2026, 2, 9, '404', 1219.98, 'INPUT', 10, 'CHEQUE 0000750', '0000750- Vicpass', null);
+    spend(2025, 7, 30, '402', 10.00, 'EXEMPTEXPENSES', 0, 'ACCOUNT FEES', 'ACCOUNT FEES', null);
+    spend(2025, 9, 30, '402', 40.00, 'EXEMPTEXPENSES', 0, 'Service fee', 'SERVICE FEE', null);
+    spend(2025, 12, 31, '402', 12.00, 'EXEMPTEXPENSES', 0, 'BANK CHQ ISSUE FEE', '', null);
+    spend(2025, 7, 5, '449', 168.20, 'INPUT', 10, 'Fuel & Lubricants', 'PETROGAS', null);
+    spend(2025, 7, 8, '449', 59.50, 'INPUT', 10, 'Fuel & Lubricants', 'LIBERTY', null);
+    spend(2025, 7, 11, '449', 51.40, 'INPUT', 10, 'Fuel & Lubricants', 'LIBERTY', null);
+    const Accounts = [
+      { Code: '404', Name: 'Accounting Fees' }, { Code: '402', Name: 'Bank Fees' }, { Code: '449', Name: 'Fuel & Lubricants' },
+    ];
+    const TaxRates = [
+      { TaxType: 'INPUT', Name: 'GST on Expenses', EffectiveRate: 10 },
+      { TaxType: 'EXEMPTEXPENSES', Name: 'GST Free Expenses', EffectiveRate: 0 },
+    ];
+    return { Accounts, TaxRates, BankTransactions, Invoices: [], ManualJournals: [] };
+  })();
+
   const getDemoReport = (type) => DEMO[type] || DEMO.ProfitAndLoss;
 
   return {
     EXCEL_NUM_FMT,
+    GL_COLUMNS,
     parseReport,
     buildAOA,
     toNumberOrString,
     formatAmount,
     sanitizeSheetName,
+    mapSource,
+    excelDateSerial,
+    buildGeneralLedger,
+    glToAOA,
     getDemoReport,
     DEMO,
     DEMO_TENANTS,
+    DEMO_SUBLEDGERS,
   };
 }));
