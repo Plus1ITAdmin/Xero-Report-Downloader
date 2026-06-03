@@ -76,7 +76,7 @@ app.use((req, res, next) => {
   res.set('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
   res.set('Vary', 'Origin');
   res.set('Access-Control-Allow-Headers', 'Content-Type');
-  res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.set('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -182,6 +182,23 @@ app.get('/api/connections', async (req, res) => {
     });
     const body = await r.text();
     res.status(r.status).type('application/json').send(body);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// Disconnect a tenant from this app (frees a connection slot). `id` is the
+// connection id from GET /connections — NOT the tenantId.
+app.delete('/api/connections/:id', async (req, res) => {
+  try {
+    const token = await getValidAccessToken();
+    const r = await fetch(`${XERO_CONNECTIONS_URL}/${encodeURIComponent(req.params.id)}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+    });
+    if (r.ok || r.status === 204) return res.json({ ok: true });
+    const body = await r.text();
+    res.status(r.status).json({ error: body || `HTTP ${r.status}` });
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message });
   }

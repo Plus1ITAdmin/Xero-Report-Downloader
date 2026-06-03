@@ -95,6 +95,8 @@
   #xrd .org-item .check { margin-left: auto; color: var(--accent); visibility: hidden; }
   #xrd .org-item.selected .check { visibility: visible; }
   #xrd .org-empty { padding: 16px; color: var(--muted); font-size: 13px; text-align: center; }
+  #xrd .client-actions { margin-top: 14px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  #xrd .client-actions-note { font-size: 12px; color: var(--muted); flex: 1; min-width: 200px; }
 
   /* Date + comparison controls */
   #xrd .controls-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; }
@@ -190,6 +192,10 @@
           <div class="org-search"><input type="text" id="orgSearch" placeholder="Search organisations…" autocomplete="off" /></div>
           <div class="org-list" id="orgList"></div>
         </div>
+      </div>
+      <div class="client-actions">
+        <button class="btn-ghost" id="removeClientBtn">Remove selected client</button>
+        <span class="client-actions-note">Disconnects it from this app to free a slot (Xero allows up to 5 connected orgs). The client's data isn't affected — reconnect any time.</span>
       </div>
     </section>
 
@@ -399,6 +405,35 @@
     }
     renderOrgList(el("orgSearch").value);
     updateGate();
+  }
+
+  function clearSelectedOrg() {
+    state.selectedTenantId = null;
+    el("orgAvatar").style.background = "#b6c2cd";
+    el("orgAvatar").textContent = "–";
+    el("orgName").textContent = "Select an organisation";
+    el("orgMeta").textContent = "No organisation selected";
+  }
+
+  // Remove (disconnect) the currently-selected client from this app's Xero
+  // connections — frees one of Xero's 5 connection slots.
+  async function removeClient() {
+    const t = state.tenants.find((x) => x.tenantId === state.selectedTenantId);
+    if (!t) { toast("Pick the client you want to remove from the dropdown first"); return; }
+    if (!confirm(`Remove "${t.tenantName}" from this app's Xero connections?\n\nThis frees a connection slot. The client's data is not affected — you can reconnect any time via "Connect to Xero".`)) return;
+    try {
+      if (!state.demo) {
+        const r = await fetch(`${API_BASE}/api/connections/${encodeURIComponent(t.id)}`, { method: "DELETE" });
+        if (!r.ok) throw new Error(((await r.json().catch(() => ({}))).error) || `HTTP ${r.status}`);
+      }
+      state.tenants = state.tenants.filter((x) => x.tenantId !== t.tenantId);
+      if (state.selectedTenantId === t.tenantId) clearSelectedOrg();
+      renderOrgList(el("orgSearch").value);
+      updateGate();
+      toast(`Removed ${t.tenantName}`);
+    } catch (e) {
+      toast(`Could not remove client: ${e.message}`);
+    }
   }
 
   const openOrg = () => { el("org").classList.add("open"); el("orgTrigger").setAttribute("aria-expanded", "true"); el("orgSearch").focus(); };
@@ -676,6 +711,7 @@
     updatePackagingLabels();
 
     el("connectBtn").addEventListener("click", () => { window.location.href = `${API_BASE}/auth/login`; });
+    el("removeClientBtn").addEventListener("click", removeClient);
     el("logoutBtn").addEventListener("click", async () => {
       await fetch(`${API_BASE}/auth/logout`, { method: "POST" });
       state.connected = false; state.tenants = []; state.selectedTenantId = null;
