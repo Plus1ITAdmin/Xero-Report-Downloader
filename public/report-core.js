@@ -345,35 +345,35 @@
     };
   }
 
-  /** GL model -> array-of-arrays for Excel, mirroring Xero's GL Detail layout. */
+  /** GL model -> array-of-arrays for Excel, mirroring Xero's GL Detail layout.
+   *  Returns rowMeta (per-row type) so the renderer can style each row. */
   function glToAOA(gl) {
-    const aoa = [], dateCells = [], numberCells = [];
-    for (const t of gl.titles) aoa.push([t]);
-    aoa.push([]);
-    aoa.push(gl.columns.slice());
+    const aoa = [], dateCells = [], numberCells = [], rowMeta = [];
+    const push = (row, type) => { aoa.push(row); rowMeta.push(type); };
+    push([gl.titles[0] || 'General Ledger Detail'], 'title');
+    push([gl.titles[1] || ''], 'client');
+    push([gl.titles[2] || ''], 'period');
+    push([], 'blank');
+    push(gl.columns.slice(), 'header');
     for (const acc of gl.accounts) {
-      aoa.push([acc.name]);
+      push([acc.name, '', '', '', '', '', '', '', '', ''], 'account');
       for (const ln of acc.lines) {
         const r = aoa.length;
         const serial = excelDateSerial(ln.date);
-        aoa.push([
+        push([
           serial, ln.source, ln.description, ln.reference,
           ln.debit != null ? ln.debit : 0, ln.credit != null ? ln.credit : 0,
           ln.runningBalance, ln.gst || 0, ln.gstRate || 0, ln.gstRateName,
-        ]);
+        ], 'row');
         if (serial !== '') dateCells.push({ r, c: 0 });
         [4, 5, 6, 7, 8].forEach((c) => numberCells.push({ r, c }));
       }
-      const rt = aoa.length;
-      aoa.push([`Total ${acc.name}`, '', '', '', acc.totalDebit, acc.totalCredit, '', '', '', '']);
-      numberCells.push({ r: rt, c: 4 }, { r: rt, c: 5 });
-      const rn = aoa.length;
+      push([`Total ${acc.name}`, '', '', '', acc.totalDebit, acc.totalCredit, '', '', '', ''], 'total');
       const nd = acc.net >= 0 ? acc.net : 0, nc = acc.net < 0 ? round2(-acc.net) : 0;
-      aoa.push(['Net movement', '', '', '', nd, nc, '', '', '', '']);
-      numberCells.push({ r: rn, c: 4 }, { r: rn, c: 5 });
-      aoa.push([]);
+      push(['Net movement', '', '', '', nd, nc, '', '', '', ''], 'net');
+      push([], 'blank');
     }
-    return { aoa, dateCells, numberCells };
+    return { aoa, dateCells, numberCells, rowMeta };
   }
 
   // ---------------------------------------------------------------------------

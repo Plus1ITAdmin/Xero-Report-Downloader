@@ -192,16 +192,40 @@
     }
 
     function glWorksheet(n) {
-      const { aoa, dateCells } = ReportCore.glToAOA(n);
+      const { aoa, dateCells, rowMeta } = ReportCore.glToAOA(n);
       const ws = XLSX.utils.aoa_to_sheet(aoa);
-      // Numbers keep Excel's General format (like Xero's GL export): 0 shows as
-      // "0" and values keep their natural precision. Only dates get a format.
+      const range = XLSX.utils.decode_range(ws['!ref']);
+      const font = (sz, bold) => ({ name: 'Arial', sz, bold: !!bold });
+      const blackBottom = { bottom: { style: 'thin', color: { rgb: '000000' } } };
+
+      // Base font Arial 12; client name 14 bold; title/header/category/total/net bold.
+      for (let r = range.s.r; r <= range.e.r; r++) {
+        const type = rowMeta[r];
+        for (let c = range.s.c; c <= range.e.c; c++) {
+          const ref = XLSX.utils.encode_cell({ r, c });
+          let cell = ws[ref];
+          // Create empty cells on category rows so the underline spans all columns.
+          if (!cell) { if (type === 'account') cell = ws[ref] = { t: 's', v: '' }; else continue; }
+          const s = cell.s || (cell.s = {});
+          if (type === 'client') s.font = font(14, true);
+          else if (type === 'title' || type === 'header' || type === 'account' || type === 'total' || type === 'net') s.font = font(12, true);
+          else s.font = font(12, false);
+          if (type === 'account') s.border = blackBottom; // black line under category name
+        }
+      }
+      // Dates -> "d mmm yyyy"
       for (const { r, c } of dateCells) {
         const ref = XLSX.utils.encode_cell({ r, c });
-        if (ws[ref]) { ws[ref].t = 'n'; ws[ref].z = 'd mmm yyyy'; }
+        if (ws[ref]) { ws[ref].t = 'n'; (ws[ref].s || (ws[ref].s = {})).numFmt = 'd mmm yyyy'; }
+      }
+      // GST Rate (col 8) on data rows -> display as a percentage (value stays the rate).
+      for (let r = range.s.r; r <= range.e.r; r++) {
+        if (rowMeta[r] !== 'row') continue;
+        const ref = XLSX.utils.encode_cell({ r, c: 8 });
+        if (ws[ref] && typeof ws[ref].v === 'number') (ws[ref].s || (ws[ref].s = {})).numFmt = '0.##"%"';
       }
       // GL has 10 fixed columns — give them sensible fixed widths.
-      ws['!cols'] = [12, 14, 40, 20, 13, 13, 15, 11, 9, 18].map((wch) => ({ wch }));
+      ws['!cols'] = [12, 14, 40, 20, 13, 13, 15, 11, 10, 18].map((wch) => ({ wch }));
       return ws;
     }
 

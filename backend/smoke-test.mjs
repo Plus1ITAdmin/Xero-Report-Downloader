@@ -11,7 +11,7 @@ import fs from 'node:fs';
 const require = createRequire(import.meta.url);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ReportCore = require(path.join(__dirname, '..', 'public', 'report-core.js'));
-const XLSX = require('xlsx');
+const XLSX = require('xlsx-js-style');
 
 let failures = 0;
 const check = (name, cond) => {

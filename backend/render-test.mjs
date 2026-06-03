@@ -17,7 +17,7 @@ const ReportCore = require(path.join(pub, 'report-core.js'));
 const ReportRender = require(path.join(pub, 'report-render.js'));
 const { jsPDF } = require('jspdf');
 require('jspdf-autotable'); // patches jsPDF.API.autoTable
-const XLSX = require('xlsx');
+const XLSX = require('xlsx-js-style');
 const JSZip = require('jszip');
 
 const R = ReportRender.createRenderer({ jsPDF, XLSX, JSZip, ReportCore });
