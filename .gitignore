@@ -1,8 +1,6 @@
 # Secrets — never commit these
 .env
 backend/.env
-.tokens.json
-backend/.tokens.json
 *.local
 
 # Dependencies
