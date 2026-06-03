@@ -34,9 +34,9 @@ const {
   // valid for older apps). The broad "accounting.reports.read" no longer works
   // for new apps and triggers invalid_scope.
   // The General Ledger is reconstructed from sub-ledgers (bank transactions,
-  // invoices/bills, manual journals) because the Journals API requires a premium
-  // Xero plan. These read-only granular scopes are available on any plan.
-  XERO_SCOPES = 'openid profile email offline_access accounting.reports.profitandloss.read accounting.reports.balancesheet.read accounting.reports.trialbalance.read accounting.reports.banksummary.read accounting.reports.executivesummary.read accounting.budgets.read accounting.settings.read accounting.banktransactions.read accounting.invoices.read accounting.manualjournals.read',
+  // invoices/bills, payments, manual journals) because the Journals API requires
+  // a premium Xero plan. These read-only granular scopes work on any plan.
+  XERO_SCOPES = 'openid profile email offline_access accounting.reports.profitandloss.read accounting.reports.balancesheet.read accounting.reports.trialbalance.read accounting.reports.banksummary.read accounting.reports.executivesummary.read accounting.budgets.read accounting.settings.read accounting.banktransactions.read accounting.invoices.read accounting.manualjournals.read accounting.payments.read',
   PORT = 3000,
   ALLOWED_ORIGIN = '*',
 } = process.env;
@@ -280,7 +280,8 @@ app.get('/api/generalledger', async (req, res) => {
     const BankTransactions = await fetchAllPages(token, tenantId, 'BankTransactions', 'BankTransactions', withStatus('Status=="AUTHORISED"'));
     const Invoices = await fetchAllPages(token, tenantId, 'Invoices', 'Invoices', withStatus('(Status=="AUTHORISED"||Status=="PAID")'));
     const ManualJournals = await fetchAllPages(token, tenantId, 'ManualJournals', 'ManualJournals', withStatus('Status=="POSTED"'));
-    res.json({ Accounts, TaxRates, BankTransactions, Invoices, ManualJournals });
+    const Payments = await fetchAllPages(token, tenantId, 'Payments', 'Payments', withStatus('Status=="AUTHORISED"'));
+    res.json({ Accounts, TaxRates, BankTransactions, Invoices, ManualJournals, Payments });
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message, endpoint: e.endpoint });
   }

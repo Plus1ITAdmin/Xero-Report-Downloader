@@ -255,7 +255,12 @@
     const o = opts || {};
     data = data || {};
     const accountName = {};
-    for (const a of (data.Accounts || [])) accountName[a.Code] = a.Name;
+    let ar = null, ap = null; // Accounts Receivable / Payable system accounts
+    for (const a of (data.Accounts || [])) {
+      accountName[a.Code] = a.Name;
+      if (a.SystemAccount === 'DEBTORS' || a.Type === 'RECEIVABLE') ar = { code: a.Code, name: a.Name };
+      if (a.SystemAccount === 'CREDITORS' || a.Type === 'PAYABLE') ap = { code: a.Code, name: a.Name };
+    }
     const taxMap = {};
     for (const t of (data.TaxRates || [])) {
       taxMap[t.TaxType] = { name: t.Name, rate: t.EffectiveRate != null ? Number(t.EffectiveRate) : (t.DisplayTaxRate != null ? Number(t.DisplayTaxRate) : 0) };
@@ -299,13 +304,33 @@
         reference: bt.Reference, contact: (bt.Contact && bt.Contact.Name) || 'Unknown', sign: isSpend ? 1 : -1,
       });
     }
-    // Invoices: ACCPAY (bill) -> debit expense, ACCREC (sales) -> credit income.
+    // Invoices: line items hit income/expense; the gross total hits the control
+    // account — AR (sales invoices, debit) or AP (bills, credit).
     for (const inv of (data.Invoices || [])) {
       const isBill = inv.Type === 'ACCPAY';
+      const date = parseJournalDate(inv.Date);
+      const contact = (inv.Contact && inv.Contact.Name) || '';
+      const ref = inv.Reference || inv.InvoiceNumber || '';
       postLines(inv.LineItems, inv.LineAmountTypes, {
-        date: parseJournalDate(inv.Date), source: isBill ? 'Bill' : 'Sales Invoice',
-        reference: inv.Reference || inv.InvoiceNumber || '', contact: (inv.Contact && inv.Contact.Name) || '', sign: isBill ? 1 : -1,
+        date, source: isBill ? 'Bill' : 'Sales Invoice', reference: ref, contact, sign: isBill ? 1 : -1,
       });
+      const total = Number(inv.Total) || 0;
+      const ctrl = isBill ? ap : ar;
+      if (total && ctrl) add(ctrl.code, ctrl.name, {
+        date, source: isBill ? 'Bill' : 'Sales Invoice', description: contact, reference: inv.InvoiceNumber || inv.Reference || '',
+        debit: isBill ? null : total, credit: isBill ? total : null, gst: 0, gstRate: 0, gstRateName: '',
+      });
+    }
+    // Payments settle the control accounts: receipts credit AR, bill payments debit AP.
+    for (const p of (data.Payments || [])) {
+      const amt = Number(p.Amount) || 0;
+      if (!amt) continue;
+      const inv = p.Invoice || {};
+      const contact = (inv.Contact && inv.Contact.Name) || '';
+      const date = parseJournalDate(p.Date);
+      const ref = p.Reference || inv.InvoiceNumber || '';
+      if (p.PaymentType === 'ACCRECPAYMENT' && ar) add(ar.code, ar.name, { date, source: 'Payment', description: contact, reference: ref, debit: null, credit: amt, gst: 0, gstRate: 0, gstRateName: '' });
+      else if (p.PaymentType === 'ACCPAYPAYMENT' && ap) add(ap.code, ap.name, { date, source: 'Payment', description: contact, reference: ref, debit: amt, credit: null, gst: 0, gstRate: 0, gstRateName: '' });
     }
     // Manual journals: LineAmount sign sets debit/credit.
     for (const mj of (data.ManualJournals || [])) {
@@ -550,14 +575,28 @@
     spend(2025, 7, 5, '449', 168.20, 'INPUT', 10, 'Fuel & Lubricants', 'PETROGAS', null);
     spend(2025, 7, 8, '449', 59.50, 'INPUT', 10, 'Fuel & Lubricants', 'LIBERTY', null);
     spend(2025, 7, 11, '449', 51.40, 'INPUT', 10, 'Fuel & Lubricants', 'LIBERTY', null);
+    const Invoices = [
+      { Type: 'ACCREC', Status: 'AUTHORISED', Date: ms(2025, 9, 15), InvoiceNumber: 'INV-1042', Total: 1100, LineAmountTypes: 'Exclusive', Contact: { Name: 'Acme Corp' },
+        LineItems: [{ AccountCode: '200', Description: 'Consulting work', LineAmount: 1000, TaxType: 'OUTPUT', TaxAmount: 100 }] },
+      { Type: 'ACCPAY', Status: 'AUTHORISED', Date: ms(2025, 10, 2), InvoiceNumber: 'BILL-559', Reference: '559', Total: 550, LineAmountTypes: 'Exclusive', Contact: { Name: 'Detour Transport' },
+        LineItems: [{ AccountCode: '449', Description: 'Cartage', LineAmount: 500, TaxType: 'INPUT', TaxAmount: 50 }] },
+    ];
+    const Payments = [
+      { PaymentType: 'ACCRECPAYMENT', Status: 'AUTHORISED', Date: ms(2025, 10, 10), Amount: 1100, Invoice: { InvoiceNumber: 'INV-1042', Contact: { Name: 'Acme Corp' } } },
+      { PaymentType: 'ACCPAYPAYMENT', Status: 'AUTHORISED', Date: ms(2025, 11, 5), Amount: 550, Invoice: { InvoiceNumber: 'BILL-559', Contact: { Name: 'Detour Transport' } } },
+    ];
     const Accounts = [
       { Code: '404', Name: 'Accounting Fees' }, { Code: '402', Name: 'Bank Fees' }, { Code: '449', Name: 'Fuel & Lubricants' },
+      { Code: '200', Name: 'Sales' },
+      { Code: '610', Name: 'Accounts Receivable', SystemAccount: 'DEBTORS' },
+      { Code: '800', Name: 'Accounts Payable', SystemAccount: 'CREDITORS' },
     ];
     const TaxRates = [
       { TaxType: 'INPUT', Name: 'GST on Expenses', EffectiveRate: 10 },
+      { TaxType: 'OUTPUT', Name: 'GST on Income', EffectiveRate: 10 },
       { TaxType: 'EXEMPTEXPENSES', Name: 'GST Free Expenses', EffectiveRate: 0 },
     ];
-    return { Accounts, TaxRates, BankTransactions, Invoices: [], ManualJournals: [] };
+    return { Accounts, TaxRates, BankTransactions, Invoices, Payments, ManualJournals: [] };
   })();
 
   const getDemoReport = (type) => DEMO[type] || DEMO.ProfitAndLoss;
