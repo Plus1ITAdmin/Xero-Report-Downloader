@@ -19,6 +19,7 @@
 import dotenv from 'dotenv';
 import express from 'express';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -67,6 +68,22 @@ if (!XERO_CLIENT_ID || !XERO_CLIENT_SECRET) {
 let tokenStore = null; // { access_token, refresh_token, expires_at }
 const pendingStates = new Set();
 
+// Persist tokens to disk so the Xero connection survives server restarts — you
+// can reconnect and see already-connected clients without re-authorising.
+const TOKENS_FILE = path.join(__dirname, '.tokens.json');
+function saveTokens() {
+  try {
+    if (tokenStore) fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokenStore));
+    else if (fs.existsSync(TOKENS_FILE)) fs.unlinkSync(TOKENS_FILE);
+  } catch (e) { console.warn('Could not persist tokens:', e.message); }
+}
+function loadTokens() {
+  try {
+    if (fs.existsSync(TOKENS_FILE)) tokenStore = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8'));
+  } catch (e) { console.warn('Could not read saved tokens:', e.message); }
+}
+loadTokens();
+
 const app = express();
 app.use(express.json());
 
@@ -102,6 +119,7 @@ async function requestToken(params) {
     refresh_token: data.refresh_token || (tokenStore && tokenStore.refresh_token),
     expires_at: Date.now() + (data.expires_in || 1800) * 1000,
   };
+  saveTokens();
   return tokenStore;
 }
 
@@ -170,6 +188,7 @@ app.get('/auth/status', (req, res) => {
 
 app.post('/auth/logout', (req, res) => {
   tokenStore = null;
+  saveTokens();
   res.json({ ok: true });
 });
 
@@ -220,6 +239,7 @@ app.listen(PORT, () => {
   console.log(`\n✅ Xero Report Downloader running at  http://localhost:${PORT}`);
   console.log(`   Redirect URI in use:  ${XERO_REDIRECT_URI}`);
   console.log(`   Scopes:  ${XERO_SCOPES}`);
+  if (tokenStore) console.log('   Restored a saved Xero connection (.tokens.json).');
   if (!XERO_CLIENT_ID) console.log('   (Demo mode only — add credentials to backend/.env to connect to Xero.)');
   console.log('');
 });
