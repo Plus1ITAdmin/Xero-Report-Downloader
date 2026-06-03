@@ -276,12 +276,21 @@ app.get('/api/generalledger', async (req, res) => {
       if (!r.ok) { const t = await r.text(); const e = new Error(t || `HTTP ${r.status}`); e.status = r.status; e.endpoint = endpoint; throw e; }
       return (JSON.parse(await r.text())[key]) || [];
     };
-    const [Accounts, TaxRates] = await Promise.all([get1('Accounts', 'Accounts'), get1('TaxRates', 'TaxRates')]);
-    const BankTransactions = await fetchAllPages(token, tenantId, 'BankTransactions', 'BankTransactions', withStatus('Status=="AUTHORISED"'));
-    const Invoices = await fetchAllPages(token, tenantId, 'Invoices', 'Invoices', withStatus('(Status=="AUTHORISED"||Status=="PAID")'));
-    const ManualJournals = await fetchAllPages(token, tenantId, 'ManualJournals', 'ManualJournals', withStatus('Status=="POSTED"'));
-    const Payments = await fetchAllPages(token, tenantId, 'Payments', 'Payments', withStatus('Status=="AUTHORISED"'));
-    res.json({ Accounts, TaxRates, BankTransactions, Invoices, ManualJournals, Payments });
+    // Resilient: if one sub-ledger 403s/errors, skip it rather than fail the whole GL.
+    const safe = async (label, fn) => { try { return await fn(); } catch (e) { console.warn(`GL: ${label} unavailable -`, e.message); return []; } };
+    const page = (endpoint, key, where) => fetchAllPages(token, tenantId, endpoint, key, where);
+
+    const [Accounts, TaxRates] = await Promise.all([
+      safe('Accounts', () => get1('Accounts', 'Accounts')),
+      safe('TaxRates', () => get1('TaxRates', 'TaxRates')),
+    ]);
+    const BankTransactions = await safe('BankTransactions', () => page('BankTransactions', 'BankTransactions', withStatus('Status=="AUTHORISED"')));
+    const Invoices = await safe('Invoices', () => page('Invoices', 'Invoices', withStatus('(Status=="AUTHORISED"||Status=="PAID")')));
+    const CreditNotes = await safe('CreditNotes', () => page('CreditNotes', 'CreditNotes', withStatus('(Status=="AUTHORISED"||Status=="PAID")')));
+    const Payments = await safe('Payments', () => page('Payments', 'Payments', withStatus('Status=="AUTHORISED"')));
+    const BankTransfers = await safe('BankTransfers', () => page('BankTransfers', 'BankTransfers', dc));
+    const ManualJournals = await safe('ManualJournals', () => page('ManualJournals', 'ManualJournals', withStatus('Status=="POSTED"')));
+    res.json({ Accounts, TaxRates, BankTransactions, Invoices, CreditNotes, Payments, BankTransfers, ManualJournals });
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message, endpoint: e.endpoint });
   }

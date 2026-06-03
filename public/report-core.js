@@ -265,28 +265,33 @@
     for (const t of (data.TaxRates || [])) {
       taxMap[t.TaxType] = { name: t.Name, rate: t.EffectiveRate != null ? Number(t.EffectiveRate) : (t.DisplayTaxRate != null ? Number(t.DisplayTaxRate) : 0) };
     }
+    let gstAcct = null;
+    for (const a of (data.Accounts || [])) if (a.SystemAccount === 'GST') gstAcct = { code: a.Code, name: a.Name };
+
     const accounts = new Map();
     let seq = 0;
-
     function add(code, fallbackName, e) {
       const key = code || fallbackName || '(No account)';
       if (!accounts.has(key)) accounts.set(key, { name: accountName[code] || fallbackName || code || '(No account)', code: code || '', lines: [] });
       e.seq = seq++;
       accounts.get(key).lines.push(e);
     }
-    function netTax(line, lineAmountTypes) {
+    function netTax(line, lat) {
       const amt = Number(line.LineAmount) || 0, tax = Number(line.TaxAmount) || 0;
-      return { net: lineAmountTypes === 'Inclusive' ? round2(amt - tax) : amt, tax };
+      return { net: lat === 'Inclusive' ? round2(amt - tax) : amt, tax };
     }
-    function postLines(lines, lineAmountTypes, meta) {
+    // Post each line item to its income/expense account; return totals for the
+    // contra (bank / AR / AP) and GST-control entries.
+    function postLines(lines, lat, meta) {
+      let totalNet = 0, totalTax = 0;
       for (const line of (lines || [])) {
-        const code = line.AccountCode;
-        if (!code) continue;
-        const { net, tax } = netTax(line, lineAmountTypes);
+        const { net, tax } = netTax(line, lat);
+        totalNet += net; totalTax += tax;
+        if (!line.AccountCode) continue;
         const value = round2(net * meta.sign);
         const tm = taxMap[line.TaxType] || {};
         const desc = meta.contact ? meta.contact + (line.Description ? ' - ' + line.Description : '') : (line.Description || '');
-        add(code, line.AccountName, {
+        add(line.AccountCode, line.AccountName, {
           date: meta.date, source: meta.source, description: desc, reference: meta.reference || '',
           debit: value > 0 ? value : null, credit: value < 0 ? round2(-value) : null,
           gst: tax ? round2(Math.abs(tax)) : 0,
@@ -294,45 +299,68 @@
           gstRateName: tm.name || line.TaxType || '',
         });
       }
+      return { totalNet: round2(totalNet), totalTax: round2(totalTax), totalGross: round2(totalNet + totalTax) };
     }
+    // A single debit/credit entry on a control/contra account (signed: + = debit).
+    function entry(acct, meta, signed) {
+      if (!acct || !acct.code || !signed) return;
+      add(acct.code, acct.name, {
+        date: meta.date, source: meta.source, description: meta.description || '', reference: meta.reference || '',
+        debit: signed > 0 ? round2(signed) : null, credit: signed < 0 ? round2(-signed) : null,
+        gst: 0, gstRate: 0, gstRateName: '',
+      });
+    }
+    const bankOf = (x) => (x ? { code: x.Code, name: x.Name } : null);
 
-    // Bank transactions: SPEND -> debit expense, RECEIVE -> credit income.
+    // --- Bank transactions: line items + GST + the bank account side ---
     for (const bt of (data.BankTransactions || [])) {
       const isSpend = String(bt.Type || '').indexOf('SPEND') === 0;
-      postLines(bt.LineItems, bt.LineAmountTypes, {
-        date: parseJournalDate(bt.Date), source: isSpend ? 'Spend Money' : 'Receive Money',
-        reference: bt.Reference, contact: (bt.Contact && bt.Contact.Name) || 'Unknown', sign: isSpend ? 1 : -1,
-      });
+      const sign = isSpend ? 1 : -1;
+      const m = { date: parseJournalDate(bt.Date), source: isSpend ? 'Spend Money' : 'Receive Money', reference: bt.Reference, contact: (bt.Contact && bt.Contact.Name) || 'Unknown' };
+      const { totalTax, totalGross } = postLines(bt.LineItems, bt.LineAmountTypes, Object.assign({ sign }, m));
+      const cm = { date: m.date, source: m.source, description: m.contact, reference: m.reference };
+      entry(gstAcct, cm, round2(totalTax * sign));
+      entry(bankOf(bt.BankAccount), cm, round2(-totalGross * sign));
     }
-    // Invoices: line items hit income/expense; the gross total hits the control
-    // account — AR (sales invoices, debit) or AP (bills, credit).
+    // --- Invoices / bills: line items + GST + AR/AP control ---
     for (const inv of (data.Invoices || [])) {
       const isBill = inv.Type === 'ACCPAY';
-      const date = parseJournalDate(inv.Date);
-      const contact = (inv.Contact && inv.Contact.Name) || '';
-      const ref = inv.Reference || inv.InvoiceNumber || '';
-      postLines(inv.LineItems, inv.LineAmountTypes, {
-        date, source: isBill ? 'Bill' : 'Sales Invoice', reference: ref, contact, sign: isBill ? 1 : -1,
-      });
-      const total = Number(inv.Total) || 0;
-      const ctrl = isBill ? ap : ar;
-      if (total && ctrl) add(ctrl.code, ctrl.name, {
-        date, source: isBill ? 'Bill' : 'Sales Invoice', description: contact, reference: inv.InvoiceNumber || inv.Reference || '',
-        debit: isBill ? null : total, credit: isBill ? total : null, gst: 0, gstRate: 0, gstRateName: '',
-      });
+      const sign = isBill ? 1 : -1;
+      const m = { date: parseJournalDate(inv.Date), source: isBill ? 'Payable Invoice' : 'Receivable Invoice', reference: inv.Reference || inv.InvoiceNumber || '', contact: (inv.Contact && inv.Contact.Name) || '' };
+      const { totalTax } = postLines(inv.LineItems, inv.LineAmountTypes, Object.assign({ sign }, m));
+      const cm = { date: m.date, source: m.source, description: m.contact, reference: inv.InvoiceNumber || inv.Reference || '' };
+      entry(gstAcct, cm, round2(totalTax * sign));
+      entry(isBill ? ap : ar, cm, isBill ? -(Number(inv.Total) || 0) : (Number(inv.Total) || 0));
     }
-    // Payments settle the control accounts: receipts credit AR, bill payments debit AP.
+    // --- Credit notes: reverse of invoices/bills ---
+    for (const cn of (data.CreditNotes || [])) {
+      const isBill = cn.Type === 'ACCPAYCREDIT';
+      const sign = isBill ? -1 : 1; // bill credit reduces expense; sales credit reduces income
+      const m = { date: parseJournalDate(cn.Date), source: isBill ? 'Payable Credit Note' : 'Receivable Credit Note', reference: cn.CreditNoteNumber || cn.Reference || '', contact: (cn.Contact && cn.Contact.Name) || '' };
+      const { totalTax } = postLines(cn.LineItems, cn.LineAmountTypes, Object.assign({ sign }, m));
+      const cm = { date: m.date, source: m.source, description: m.contact, reference: m.reference };
+      entry(gstAcct, cm, round2(totalTax * sign));
+      entry(isBill ? ap : ar, cm, isBill ? (Number(cn.Total) || 0) : -(Number(cn.Total) || 0));
+    }
+    // --- Payments: AR/AP control + the bank account side ---
     for (const p of (data.Payments || [])) {
       const amt = Number(p.Amount) || 0;
       if (!amt) continue;
       const inv = p.Invoice || {};
-      const contact = (inv.Contact && inv.Contact.Name) || '';
-      const date = parseJournalDate(p.Date);
-      const ref = p.Reference || inv.InvoiceNumber || '';
-      if (p.PaymentType === 'ACCRECPAYMENT' && ar) add(ar.code, ar.name, { date, source: 'Payment', description: contact, reference: ref, debit: null, credit: amt, gst: 0, gstRate: 0, gstRateName: '' });
-      else if (p.PaymentType === 'ACCPAYPAYMENT' && ap) add(ap.code, ap.name, { date, source: 'Payment', description: contact, reference: ref, debit: amt, credit: null, gst: 0, gstRate: 0, gstRateName: '' });
+      const m = { date: parseJournalDate(p.Date), reference: p.Reference || inv.InvoiceNumber || '', description: (inv.Contact && inv.Contact.Name) || '' };
+      const bank = bankOf(p.Account);
+      if (p.PaymentType === 'ACCRECPAYMENT') { entry(ar, Object.assign({ source: 'Receivable Payment' }, m), -amt); entry(bank, Object.assign({ source: 'Receivable Payment' }, m), amt); }
+      else if (p.PaymentType === 'ACCPAYPAYMENT') { entry(ap, Object.assign({ source: 'Payable Payment' }, m), amt); entry(bank, Object.assign({ source: 'Payable Payment' }, m), -amt); }
     }
-    // Manual journals: LineAmount sign sets debit/credit.
+    // --- Bank transfers: out of one bank account, into another ---
+    for (const tr of (data.BankTransfers || [])) {
+      const amt = Number(tr.Amount) || 0;
+      if (!amt) continue;
+      const m = { date: parseJournalDate(tr.Date), source: 'Bank Transfer', reference: tr.Reference || '', description: '' };
+      entry(bankOf(tr.FromBankAccount), m, -amt);
+      entry(bankOf(tr.ToBankAccount), m, amt);
+    }
+    // --- Manual journals: any account, signed LineAmount ---
     for (const mj of (data.ManualJournals || [])) {
       const date = parseJournalDate(mj.Date);
       for (const line of (mj.JournalLines || [])) {
@@ -557,11 +585,12 @@
   // Synthetic sub-ledger data so Demo mode can render a General Ledger.
   const DEMO_SUBLEDGERS = (function () {
     const ms = (y, mo, d) => `/Date(${Date.UTC(y, mo - 1, d)}+0000)/`;
+    const BANK = { Code: '090', Name: 'Business Bank Account' };
     const BankTransactions = [];
     function spend(y, mo, d, code, net, taxType, rate, desc, ref, contact) {
       BankTransactions.push({
         Type: 'SPEND', Status: 'AUTHORISED', Date: ms(y, mo, d), Reference: ref || '', LineAmountTypes: 'Exclusive',
-        Contact: contact ? { Name: contact } : undefined,
+        BankAccount: BANK, Contact: contact ? { Name: contact } : undefined,
         LineItems: [{ AccountCode: code, Description: desc, LineAmount: net, TaxType: taxType, TaxAmount: round2(net * rate / 100) }],
       });
     }
@@ -581,22 +610,31 @@
       { Type: 'ACCPAY', Status: 'AUTHORISED', Date: ms(2025, 10, 2), InvoiceNumber: 'BILL-559', Reference: '559', Total: 550, LineAmountTypes: 'Exclusive', Contact: { Name: 'Detour Transport' },
         LineItems: [{ AccountCode: '449', Description: 'Cartage', LineAmount: 500, TaxType: 'INPUT', TaxAmount: 50 }] },
     ];
+    const CreditNotes = [
+      { Type: 'ACCPAYCREDIT', Status: 'AUTHORISED', Date: ms(2025, 10, 20), CreditNoteNumber: 'CN-12', Total: 110, LineAmountTypes: 'Exclusive', Contact: { Name: 'Detour Transport' },
+        LineItems: [{ AccountCode: '449', Description: 'Cartage refund', LineAmount: 100, TaxType: 'INPUT', TaxAmount: 10 }] },
+    ];
     const Payments = [
-      { PaymentType: 'ACCRECPAYMENT', Status: 'AUTHORISED', Date: ms(2025, 10, 10), Amount: 1100, Invoice: { InvoiceNumber: 'INV-1042', Contact: { Name: 'Acme Corp' } } },
-      { PaymentType: 'ACCPAYPAYMENT', Status: 'AUTHORISED', Date: ms(2025, 11, 5), Amount: 550, Invoice: { InvoiceNumber: 'BILL-559', Contact: { Name: 'Detour Transport' } } },
+      { PaymentType: 'ACCRECPAYMENT', Status: 'AUTHORISED', Date: ms(2025, 10, 10), Amount: 1100, Account: BANK, Invoice: { InvoiceNumber: 'INV-1042', Contact: { Name: 'Acme Corp' } } },
+      { PaymentType: 'ACCPAYPAYMENT', Status: 'AUTHORISED', Date: ms(2025, 11, 5), Amount: 550, Account: BANK, Invoice: { InvoiceNumber: 'BILL-559', Contact: { Name: 'Detour Transport' } } },
+    ];
+    const BankTransfers = [
+      { Date: ms(2025, 12, 1), Amount: 5000, Reference: 'To savings', FromBankAccount: BANK, ToBankAccount: { Code: '091', Name: 'Savings Account' } },
     ];
     const Accounts = [
       { Code: '404', Name: 'Accounting Fees' }, { Code: '402', Name: 'Bank Fees' }, { Code: '449', Name: 'Fuel & Lubricants' },
       { Code: '200', Name: 'Sales' },
+      { Code: '090', Name: 'Business Bank Account', Type: 'BANK' }, { Code: '091', Name: 'Savings Account', Type: 'BANK' },
       { Code: '610', Name: 'Accounts Receivable', SystemAccount: 'DEBTORS' },
       { Code: '800', Name: 'Accounts Payable', SystemAccount: 'CREDITORS' },
+      { Code: '820', Name: 'GST', SystemAccount: 'GST' },
     ];
     const TaxRates = [
       { TaxType: 'INPUT', Name: 'GST on Expenses', EffectiveRate: 10 },
       { TaxType: 'OUTPUT', Name: 'GST on Income', EffectiveRate: 10 },
       { TaxType: 'EXEMPTEXPENSES', Name: 'GST Free Expenses', EffectiveRate: 0 },
     ];
-    return { Accounts, TaxRates, BankTransactions, Invoices, Payments, ManualJournals: [] };
+    return { Accounts, TaxRates, BankTransactions, Invoices, CreditNotes, Payments, BankTransfers, ManualJournals: [] };
   })();
 
   const getDemoReport = (type) => DEMO[type] || DEMO.ProfitAndLoss;
