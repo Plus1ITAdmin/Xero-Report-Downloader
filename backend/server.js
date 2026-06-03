@@ -16,13 +16,15 @@
  *     during testing. Lock ALLOWED_ORIGIN down before exposing this anywhere.
  * -------------------------------------------------------------------------
  */
-import 'dotenv/config';
+import dotenv from 'dotenv';
 import express from 'express';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// Load backend/.env regardless of which directory the process is launched from.
+dotenv.config({ path: path.join(__dirname, '.env') });
 
 const {
   XERO_CLIENT_ID,
