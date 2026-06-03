@@ -30,7 +30,10 @@ const {
   XERO_CLIENT_ID,
   XERO_CLIENT_SECRET,
   XERO_REDIRECT_URI = 'http://localhost:3000/callback',
-  XERO_SCOPES = 'openid profile email offline_access accounting.reports.read accounting.settings.read',
+  // Granular report scopes (required for apps created on/after 2 Mar 2026; also
+  // valid for older apps). The broad "accounting.reports.read" no longer works
+  // for new apps and triggers invalid_scope.
+  XERO_SCOPES = 'openid profile email offline_access accounting.reports.profitandloss.read accounting.reports.balancesheet.read accounting.reports.trialbalance.read accounting.reports.banksummary.read accounting.reports.executivesummary.read accounting.budgets.read',
   PORT = 3000,
   ALLOWED_ORIGIN = '*',
 } = process.env;
@@ -216,6 +219,7 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 app.listen(PORT, () => {
   console.log(`\n✅ Xero Report Downloader running at  http://localhost:${PORT}`);
   console.log(`   Redirect URI in use:  ${XERO_REDIRECT_URI}`);
+  console.log(`   Scopes:  ${XERO_SCOPES}`);
   if (!XERO_CLIENT_ID) console.log('   (Demo mode only — add credentials to backend/.env to connect to Xero.)');
   console.log('');
 });
