@@ -284,6 +284,7 @@
     { id: "BankSummary",      name: "Bank Summary",      dateType: "range", periods: false },
     { id: "ExecutiveSummary", name: "Executive Summary", dateType: "asAt",  periods: false },
     { id: "BudgetSummary",    name: "Budget Summary",    dateType: "asAt",  periods: true  },
+    { id: "GeneralLedger",    name: "General Ledger Detail", dateType: "range", periods: false, special: "gl" },
   ];
 
   const state = {
@@ -578,6 +579,20 @@
     return JSON.parse(text);
   }
 
+  // General Ledger source — pulls journals (paginated server-side) for the period.
+  async function fetchJournals(report) {
+    const p = paramsFor(report);
+    const qs = new URLSearchParams({ tenantId: state.selectedTenantId, fromDate: p.fromDate || "", toDate: p.toDate || "" });
+    const r = await fetch(`${API_BASE}/api/journals?${qs.toString()}`);
+    const text = await r.text();
+    if (!r.ok) {
+      let msg = `HTTP ${r.status}`;
+      try { msg = JSON.parse(text).error || msg; } catch (_) {}
+      throw new Error(msg);
+    }
+    return JSON.parse(text);
+  }
+
   // =====================================================================
   // Rendering — shared with the Node render-test harness via report-render.js,
   // so the PDF/Excel layout that ships is exactly what gets verified headlessly.
@@ -635,12 +650,20 @@
     const btn = el("exportBtn"); btn.disabled = true; const label = btn.textContent; btn.textContent = "Working…";
     logReset();
 
+    const org = (state.tenants.find((t) => t.tenantId === state.selectedTenantId) || {}).tenantName || "Xero";
     const results = [];
     for (const r of chosen) {
       const line = logLine(`Fetching ${r.name}…`);
       try {
-        const json = await fetchReportJson(r);
-        results.push({ report: r, normalized: ReportCore.parseReport(json) });
+        let normalized;
+        if (r.special === "gl") {
+          const p = paramsFor(r);
+          const journals = state.demo ? ReportCore.DEMO_JOURNALS : await fetchJournals(r);
+          normalized = ReportCore.buildGeneralLedger(journals, { orgName: org, fromDate: p.fromDate, toDate: p.toDate });
+        } else {
+          normalized = ReportCore.parseReport(await fetchReportJson(r));
+        }
+        results.push({ report: r, normalized });
         line.className = "log-line ok"; line.innerHTML = `✓ <span>${r.name}</span>`;
       } catch (e) {
         line.className = "log-line err"; line.innerHTML = `✗ <span>${r.name} — ${e.message}</span>`;
@@ -650,7 +673,6 @@
     if (!results.length) { toast("No reports could be generated."); btn.disabled = false; btn.textContent = label; return; }
 
     const R = renderer();
-    const org = (state.tenants.find((t) => t.tenantId === state.selectedTenantId) || {}).tenantName || "Xero";
     const tag = el("masterEnd").value || iso(new Date());
     try {
       if (state.format === "pdf") {
