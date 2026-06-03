@@ -36,7 +36,11 @@ const {
   // The General Ledger is reconstructed from sub-ledgers (bank transactions,
   // invoices/bills, payments, manual journals) because the Journals API requires
   // a premium Xero plan. These read-only granular scopes work on any plan.
-  XERO_SCOPES = 'openid profile email offline_access accounting.reports.profitandloss.read accounting.reports.balancesheet.read accounting.reports.trialbalance.read accounting.reports.banksummary.read accounting.reports.executivesummary.read accounting.budgets.read accounting.settings.read accounting.banktransactions.read accounting.invoices.read accounting.manualjournals.read accounting.payments.read',
+  // Payroll scopes (payroll.payruns.read + payroll.settings.read) let the GL
+  // include pay-run journals (wages, PAYG, super, net pay). They're optional:
+  // if the org has no payroll or the scope isn't granted, the payroll fetch is
+  // skipped and the rest of the GL still builds.
+  XERO_SCOPES = 'openid profile email offline_access accounting.reports.profitandloss.read accounting.reports.balancesheet.read accounting.reports.trialbalance.read accounting.reports.banksummary.read accounting.reports.executivesummary.read accounting.budgets.read accounting.settings.read accounting.banktransactions.read accounting.invoices.read accounting.manualjournals.read accounting.payments.read payroll.payruns.read payroll.settings.read',
   PORT = 3000,
   ALLOWED_ORIGIN = '*',
 } = process.env;
@@ -46,6 +50,7 @@ const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize';
 const XERO_TOKEN_URL = 'https://identity.xero.com/connect/token';
 const XERO_CONNECTIONS_URL = 'https://api.xero.com/connections';
 const XERO_API_BASE = 'https://api.xero.com/api.xro/2.0';
+const XERO_PAYROLL_BASE = 'https://api.xero.com/payroll.xro/1.0'; // AU Payroll
 
 // Whitelisted query params per report type. Anything not listed is dropped so
 // the frontend can never push unexpected params at Xero.
@@ -234,10 +239,10 @@ app.get('/api/report', async (req, res) => {
 });
 
 // Fetch all pages (100/page) of a list endpoint, optionally with a `where` filter.
-async function fetchAllPages(token, tenantId, endpoint, key, where) {
+async function fetchAllPages(token, tenantId, endpoint, key, where, base = XERO_API_BASE) {
   const out = [];
   for (let page = 1; page <= 100; page++) {
-    const url = new URL(`${XERO_API_BASE}/${endpoint}`);
+    const url = new URL(`${base}/${endpoint}`);
     url.searchParams.set('page', String(page));
     if (where) url.searchParams.set('where', where);
     const r = await fetch(url.toString(), {
@@ -260,10 +265,28 @@ function dateClause(fromDate, toDate) {
   return parts.join('&&');
 }
 
+// The Payroll API doesn't take a `where` date filter on pay runs, so keep only
+// POSTED runs whose PaymentDate falls in the period. Dates arrive as MS-JSON
+// ("/Date(ms+0000)/") or ISO.
+function filterPayRuns(runs, fromDate, toDate) {
+  const toDateObj = (s) => { if (!s) return null; const m = /\/Date\((-?\d+)/.exec(String(s)); const d = m ? new Date(parseInt(m[1], 10)) : new Date(s); return isNaN(d.getTime()) ? null : d; };
+  const from = fromDate ? new Date(`${fromDate}T00:00:00Z`) : null;
+  const to = toDate ? new Date(`${toDate}T23:59:59Z`) : null;
+  return (runs || []).filter((r) => {
+    if (r.PayRunStatus && r.PayRunStatus !== 'POSTED') return false;
+    const d = toDateObj(r.PaymentDate || r.PayRunPeriodEndDate);
+    if (!d) return true;
+    if (from && d < from) return false;
+    if (to && d > to) return false;
+    return true;
+  });
+}
+
 // General Ledger source: the Journals API needs a premium plan, so we
 // reconstruct the GL from sub-ledgers. Fetches the chart of accounts + tax rates
-// (for names) plus posted bank transactions, invoices/bills and manual journals
-// for the period. The frontend assembles these into the GL (see report-core).
+// (for names) plus posted bank transactions, invoices/bills, credit notes,
+// payments, bank transfers, manual journals and payroll pay runs for the period.
+// The frontend assembles these into the GL (see report-core).
 app.get('/api/generalledger', async (req, res) => {
   const { tenantId, fromDate, toDate } = req.query;
   if (!tenantId) return res.status(400).json({ error: 'Missing tenantId' });
@@ -271,13 +294,13 @@ app.get('/api/generalledger', async (req, res) => {
   const withStatus = (status) => [dc, status].filter(Boolean).join('&&');
   try {
     const token = await getValidAccessToken();
-    const get1 = async (endpoint, key) => {
-      const r = await fetch(`${XERO_API_BASE}/${endpoint}`, { headers: { Authorization: `Bearer ${token}`, 'Xero-tenant-id': tenantId, Accept: 'application/json' } });
+    const get1 = async (endpoint, key, base = XERO_API_BASE) => {
+      const r = await fetch(`${base}/${endpoint}`, { headers: { Authorization: `Bearer ${token}`, 'Xero-tenant-id': tenantId, Accept: 'application/json' } });
       if (!r.ok) { const t = await r.text(); const e = new Error(t || `HTTP ${r.status}`); e.status = r.status; e.endpoint = endpoint; throw e; }
       return (JSON.parse(await r.text())[key]) || [];
     };
     // Resilient: if one sub-ledger 403s/errors, skip it rather than fail the whole GL.
-    const safe = async (label, fn) => { try { return await fn(); } catch (e) { console.warn(`GL: ${label} unavailable -`, e.message); return []; } };
+    const safe = async (label, fn, fallback = []) => { try { return await fn(); } catch (e) { console.warn(`GL: ${label} unavailable -`, e.message); return fallback; } };
     const page = (endpoint, key, where) => fetchAllPages(token, tenantId, endpoint, key, where);
 
     const [Accounts, TaxRates] = await Promise.all([
@@ -290,7 +313,13 @@ app.get('/api/generalledger', async (req, res) => {
     const Payments = await safe('Payments', () => page('Payments', 'Payments', withStatus('Status=="AUTHORISED"')));
     const BankTransfers = await safe('BankTransfers', () => page('BankTransfers', 'BankTransfers', dc));
     const ManualJournals = await safe('ManualJournals', () => page('ManualJournals', 'ManualJournals', withStatus('Status=="POSTED"')));
-    res.json({ Accounts, TaxRates, BankTransactions, Invoices, CreditNotes, Payments, BankTransfers, ManualJournals });
+    // Payroll (AU): pay-run totals + the account mappings needed to post them.
+    // Optional — skipped cleanly if there's no payroll or the scope isn't granted.
+    const allPayRuns = await safe('PayRuns', () => fetchAllPages(token, tenantId, 'PayRuns', 'PayRuns', null, XERO_PAYROLL_BASE));
+    const PayRuns = filterPayRuns(allPayRuns, fromDate, toDate);
+    const PayItems = await safe('PayItems', () => get1('PayItems', 'PayItems', XERO_PAYROLL_BASE), {});
+    const PayrollSettings = await safe('PayrollSettings', () => get1('Settings', 'Settings', XERO_PAYROLL_BASE), {});
+    res.json({ Accounts, TaxRates, BankTransactions, Invoices, CreditNotes, Payments, BankTransfers, ManualJournals, PayRuns, PayItems, PayrollSettings });
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message, endpoint: e.endpoint });
   }

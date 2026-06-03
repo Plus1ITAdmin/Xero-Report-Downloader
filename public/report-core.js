@@ -376,6 +376,64 @@
       }
     }
 
+    // --- Payroll: one journal per pay run, mirroring Xero's "Payroll Expense
+    //     Journal" — earnings + super expense are debited; PAYG, super and net
+    //     pay are credited to their liability accounts. Amounts come from the
+    //     pay-run totals; accounts are resolved from Payroll Settings / Pay
+    //     Items, falling back to the chart of accounts by name. (Payroll posts
+    //     via system journals the sub-ledger endpoints don't expose, so it has
+    //     to be rebuilt from the Payroll API.)
+    function resolvePayrollAccounts(d) {
+      const accts = d.Accounts || [];
+      const byName = (re, excl) => {
+        const m = accts.find((a) => re.test(a.Name || '') && !(excl && excl.test(a.Name || '')));
+        return m ? { code: m.Code, name: m.Name } : null;
+      };
+      const byCode = (code) => { const a = accts.find((x) => String(x.Code) === String(code)); return a ? { code: a.Code, name: a.Name } : (code ? { code, name: '' } : null); };
+      // Payroll Settings expose payroll-role accounts; match their type loosely.
+      const sAccts = (d.PayrollSettings && d.PayrollSettings.Accounts) || [];
+      const byType = {};
+      for (const a of sAccts) { const t = String(a.Type || a.AccountType || '').toUpperCase().replace(/[^A-Z]/g, ''); if (t) byType[t] = a.Code || a.AccountCode; }
+      const fromType = (...keys) => { for (const k of keys) if (byType[k]) return byCode(byType[k]); return null; };
+      // Earnings expense: the most-used account across Pay Items earnings rates.
+      let earnings = null;
+      const rates = (d.PayItems && d.PayItems.EarningsRates) || [];
+      if (rates.length) {
+        const counts = {};
+        for (const r of rates) if (r.AccountCode) counts[r.AccountCode] = (counts[r.AccountCode] || 0) + 1;
+        const top = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+        if (top) earnings = byCode(top[0]);
+      }
+      return {
+        wagesExpense: earnings || fromType('WAGESEXPENSE', 'EARNINGS') || byName(/salar|wages/i, /payable/i),
+        superExpense: fromType('SUPERANNUATIONEXPENSE', 'SUPEREXPENSE') || byName(/superannuation|super\b/i, /payable|liabilit/i),
+        paygLiability: fromType('PAYGLIABILITY', 'TAXLIABILITY', 'PAYG') || byName(/payg|withhold/i),
+        superLiability: fromType('SUPERANNUATIONLIABILITY', 'SUPERLIABILITY') || byName(/super.*(payable|liabilit)/i),
+        wagesPayable: fromType('WAGESPAYABLE', 'NETPAY') || byName(/wages payable|net pay|payroll.*payable/i),
+        deductionLiability: fromType('DEDUCTIONLIABILITY', 'DEDUCTION') || byName(/deduction/i),
+        reimbursement: fromType('REIMBURSEMENT') || byName(/reimburs/i),
+      };
+    }
+    const payAcct = resolvePayrollAccounts(data);
+    for (const run of (data.PayRuns || [])) {
+      const date = parseJournalDate(run.PaymentDate || run.PayRunPeriodEndDate);
+      const wages = round2(Number(run.Wages) || 0);
+      const tax = round2(Number(run.Tax) || 0);
+      const sup = round2(Number(run.Super) || 0);
+      const ded = round2(Number(run.Deductions) || 0);
+      const reimb = round2(Number(run.Reimbursement) || 0);
+      const net = round2(Number(run.NetPay) || 0);
+      if (!wages && !tax && !sup && !net) continue;
+      const M = (desc) => ({ date, source: 'Payroll Expense', description: desc, reference: 'Payroll Expense Journal' });
+      entry(payAcct.wagesExpense, M('Earnings'), wages);
+      entry(payAcct.superExpense, M('Superannuation Expense'), sup);
+      if (reimb) entry(payAcct.reimbursement || payAcct.wagesExpense, M('Reimbursement'), reimb);
+      entry(payAcct.paygLiability, M('Tax'), -tax);
+      entry(payAcct.superLiability, M('Superannuation Liability'), -sup);
+      if (ded) entry(payAcct.deductionLiability || payAcct.wagesPayable, M('Deductions'), -ded);
+      entry(payAcct.wagesPayable, M('Wages Payable'), -net);
+    }
+
     const list = [...accounts.values()];
     for (const acc of list) {
       acc.lines.sort((a, b) => (a.date - b.date) || (a.seq - b.seq));
@@ -628,13 +686,20 @@
       { Code: '610', Name: 'Accounts Receivable', SystemAccount: 'DEBTORS' },
       { Code: '800', Name: 'Accounts Payable', SystemAccount: 'CREDITORS' },
       { Code: '820', Name: 'GST', SystemAccount: 'GST' },
+      { Code: '477', Name: 'Salary & Wages' }, { Code: '478', Name: 'Superannuation' },
+      { Code: '825', Name: 'PAYG Withholdings Payable' }, { Code: '826', Name: 'Superannuation Payable' },
+      { Code: '814', Name: 'Wages Payable - Payroll' },
     ];
     const TaxRates = [
       { TaxType: 'INPUT', Name: 'GST on Expenses', EffectiveRate: 10 },
       { TaxType: 'OUTPUT', Name: 'GST on Income', EffectiveRate: 10 },
       { TaxType: 'EXEMPTEXPENSES', Name: 'GST Free Expenses', EffectiveRate: 0 },
     ];
-    return { Accounts, TaxRates, BankTransactions, Invoices, CreditNotes, Payments, BankTransfers, ManualJournals: [] };
+    const PayRuns = [
+      { PayRunID: 'pr1', PayRunStatus: 'POSTED', PaymentDate: ms(2025, 7, 15), Wages: 10000, Tax: 2500, Super: 1100, Deductions: 0, Reimbursement: 0, NetPay: 7500 },
+      { PayRunID: 'pr2', PayRunStatus: 'POSTED', PaymentDate: ms(2025, 7, 29), Wages: 12000, Tax: 3100, Super: 1320, Deductions: 0, Reimbursement: 0, NetPay: 8900 },
+    ];
+    return { Accounts, TaxRates, BankTransactions, Invoices, CreditNotes, Payments, BankTransfers, ManualJournals: [], PayRuns, PayItems: {}, PayrollSettings: {} };
   })();
 
   const getDemoReport = (type) => DEMO[type] || DEMO.ProfitAndLoss;
