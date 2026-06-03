@@ -244,61 +244,104 @@
   const GL_COLUMNS = ['Date', 'Source', 'Description', 'Reference', 'Debit', 'Credit', 'Running Balance', 'GST', 'GST Rate', 'GST Rate Name'];
 
   /**
-   * Build a General Ledger Detail model from a Journals API response.
-   * opts: { orgName, fromDate, toDate }  (dates ISO yyyy-mm-dd)
+   * Build a General Ledger Detail model from sub-ledger data (the Journals API
+   * needs a premium plan). `data` = { Accounts, TaxRates, BankTransactions,
+   * Invoices, ManualJournals }. opts: { orgName, fromDate, toDate }.
+   *
+   * Every line item posts directly to its income/expense account; balance-sheet
+   * control accounts (bank, AR/AP, GST) are system-generated and not included.
    */
-  function buildGeneralLedger(journalsResponse, opts) {
+  function buildGeneralLedger(data, opts) {
     const o = opts || {};
-    const journals = (journalsResponse && journalsResponse.Journals) || [];
+    data = data || {};
+    const accountName = {};
+    for (const a of (data.Accounts || [])) accountName[a.Code] = a.Name;
+    const taxMap = {};
+    for (const t of (data.TaxRates || [])) {
+      taxMap[t.TaxType] = { name: t.Name, rate: t.EffectiveRate != null ? Number(t.EffectiveRate) : (t.DisplayTaxRate != null ? Number(t.DisplayTaxRate) : 0) };
+    }
     const accounts = new Map();
+    let seq = 0;
 
-    for (const j of journals) {
-      const date = parseJournalDate(j.JournalDate);
-      const source = mapSource(j.SourceType);
-      const reference = j.Reference || '';
-      for (const line of (j.JournalLines || [])) {
-        const net = Number(line.NetAmount) || 0;
-        const tax = Number(line.TaxAmount) || 0;
-        const key = line.AccountID || `${line.AccountCode || ''}|${line.AccountName || ''}`;
-        if (!accounts.has(key)) {
-          accounts.set(key, { name: line.AccountName || '(No account)', code: line.AccountCode || '', lines: [] });
-        }
-        accounts.get(key).lines.push({
-          date, journalNumber: j.JournalNumber || 0, source,
-          description: line.Description || '',
-          reference,
-          debit: net > 0 ? net : null,
-          credit: net < 0 ? -net : null,
+    function add(code, fallbackName, e) {
+      const key = code || fallbackName || '(No account)';
+      if (!accounts.has(key)) accounts.set(key, { name: accountName[code] || fallbackName || code || '(No account)', code: code || '', lines: [] });
+      e.seq = seq++;
+      accounts.get(key).lines.push(e);
+    }
+    function netTax(line, lineAmountTypes) {
+      const amt = Number(line.LineAmount) || 0, tax = Number(line.TaxAmount) || 0;
+      return { net: lineAmountTypes === 'Inclusive' ? round2(amt - tax) : amt, tax };
+    }
+    function postLines(lines, lineAmountTypes, meta) {
+      for (const line of (lines || [])) {
+        const code = line.AccountCode;
+        if (!code) continue;
+        const { net, tax } = netTax(line, lineAmountTypes);
+        const value = round2(net * meta.sign);
+        const tm = taxMap[line.TaxType] || {};
+        const desc = meta.contact ? meta.contact + (line.Description ? ' - ' + line.Description : '') : (line.Description || '');
+        add(code, line.AccountName, {
+          date: meta.date, source: meta.source, description: desc, reference: meta.reference || '',
+          debit: value > 0 ? value : null, credit: value < 0 ? round2(-value) : null,
           gst: tax ? round2(Math.abs(tax)) : 0,
-          gstRate: net !== 0 ? round2(Math.abs(tax / net) * 100) : 0,
-          gstRateName: line.TaxName || '',
+          gstRate: tm.rate != null ? tm.rate : (net ? round2(Math.abs(tax / net) * 100) : 0),
+          gstRateName: tm.name || line.TaxType || '',
+        });
+      }
+    }
+
+    // Bank transactions: SPEND -> debit expense, RECEIVE -> credit income.
+    for (const bt of (data.BankTransactions || [])) {
+      const isSpend = String(bt.Type || '').indexOf('SPEND') === 0;
+      postLines(bt.LineItems, bt.LineAmountTypes, {
+        date: parseJournalDate(bt.Date), source: isSpend ? 'Spend Money' : 'Receive Money',
+        reference: bt.Reference, contact: (bt.Contact && bt.Contact.Name) || 'Unknown', sign: isSpend ? 1 : -1,
+      });
+    }
+    // Invoices: ACCPAY (bill) -> debit expense, ACCREC (sales) -> credit income.
+    for (const inv of (data.Invoices || [])) {
+      const isBill = inv.Type === 'ACCPAY';
+      postLines(inv.LineItems, inv.LineAmountTypes, {
+        date: parseJournalDate(inv.Date), source: isBill ? 'Bill' : 'Sales Invoice',
+        reference: inv.Reference || inv.InvoiceNumber || '', contact: (inv.Contact && inv.Contact.Name) || '', sign: isBill ? 1 : -1,
+      });
+    }
+    // Manual journals: LineAmount sign sets debit/credit.
+    for (const mj of (data.ManualJournals || [])) {
+      const date = parseJournalDate(mj.Date);
+      for (const line of (mj.JournalLines || [])) {
+        if (!line.AccountCode) continue;
+        const amt = Number(line.LineAmount) || 0, tax = Number(line.TaxAmount) || 0;
+        const tm = taxMap[line.TaxType] || {};
+        add(line.AccountCode, line.AccountName, {
+          date, source: 'Manual Journal', description: line.Description || mj.Narration || '', reference: '',
+          debit: amt > 0 ? amt : null, credit: amt < 0 ? round2(-amt) : null,
+          gst: tax ? round2(Math.abs(tax)) : 0,
+          gstRate: tm.rate != null ? tm.rate : 0, gstRateName: tm.name || line.TaxType || '',
         });
       }
     }
 
     const list = [...accounts.values()];
     for (const acc of list) {
-      acc.lines.sort((a, b) => (a.date - b.date) || (a.journalNumber - b.journalNumber));
+      acc.lines.sort((a, b) => (a.date - b.date) || (a.seq - b.seq));
       let bal = 0, td = 0, tc = 0;
       for (const ln of acc.lines) {
         bal += (ln.debit || 0) - (ln.credit || 0);
         ln.runningBalance = round2(bal);
         td += ln.debit || 0; tc += ln.credit || 0;
       }
-      acc.totalDebit = round2(td);
-      acc.totalCredit = round2(tc);
-      acc.net = round2(td - tc);
+      acc.totalDebit = round2(td); acc.totalCredit = round2(tc); acc.net = round2(td - tc);
     }
     list.sort((a, b) => String(a.name).localeCompare(String(b.name)));
 
     const fromD = isoToLocalDate(o.fromDate), toD = isoToLocalDate(o.toDate);
     const period = (fromD && toD) ? `For the period ${fmtLongDate(fromD)} to ${fmtLongDate(toD)}` : '';
     return {
-      kind: 'generalledger',
-      reportName: 'General Ledger Detail',
+      kind: 'generalledger', reportName: 'General Ledger Detail',
       titles: ['General Ledger Detail', o.orgName || '', period].filter(Boolean),
-      columns: GL_COLUMNS.slice(),
-      accounts: list,
+      columns: GL_COLUMNS.slice(), accounts: list,
     };
   }
 
@@ -486,31 +529,35 @@
     { tenantId: 'demo-tenant-003', tenantName: 'Riverside Cafe Trust', tenantType: 'ORGANISATION' },
   ];
 
-  // Synthetic journals so Demo mode can render a General Ledger in the right shape.
-  const DEMO_JOURNALS = (function () {
-    let n = 1000; const J = [];
+  // Synthetic sub-ledger data so Demo mode can render a General Ledger.
+  const DEMO_SUBLEDGERS = (function () {
     const ms = (y, mo, d) => `/Date(${Date.UTC(y, mo - 1, d)}+0000)/`;
-    function spend(y, mo, d, account, code, net, ratePct, desc, ref) {
-      const tax = round2(net * ratePct / 100);
-      J.push({
-        JournalNumber: n++, JournalDate: ms(y, mo, d), SourceType: 'CASHPAID', Reference: ref || '',
-        JournalLines: [
-          { AccountCode: code, AccountName: account, Description: desc, NetAmount: net, TaxAmount: tax, TaxName: ratePct ? 'GST on Expenses' : 'GST Free Expenses' },
-          { AccountCode: '090', AccountName: 'Business Bank Account', Description: desc, NetAmount: -round2(net + tax), TaxAmount: 0, TaxName: '' },
-        ],
+    const BankTransactions = [];
+    function spend(y, mo, d, code, net, taxType, rate, desc, ref, contact) {
+      BankTransactions.push({
+        Type: 'SPEND', Status: 'AUTHORISED', Date: ms(y, mo, d), Reference: ref || '', LineAmountTypes: 'Exclusive',
+        Contact: contact ? { Name: contact } : undefined,
+        LineItems: [{ AccountCode: code, Description: desc, LineAmount: net, TaxType: taxType, TaxAmount: round2(net * rate / 100) }],
       });
     }
-    spend(2025, 8, 12, 'Accounting Fees', '404', 723.34, 10, 'Unknown - CHEQUE 0000722', '0000722');
-    spend(2025, 10, 3, 'Accounting Fees', '404', 181.82, 10, 'Vicpass - CHEQUE 0000730', '');
-    spend(2025, 11, 18, 'Accounting Fees', '404', 651.67, 10, 'Vicpass - CHEQUE 0000730', '');
-    spend(2026, 2, 9, 'Accounting Fees', '404', 1219.98, 10, 'Unknown - CHEQUE 0000750', '0000750- Vicpass');
-    spend(2025, 7, 30, 'Bank Fees', '402', 10.00, 0, 'Unknown - ACCOUNT FEES', 'ACCOUNT FEES');
-    spend(2025, 9, 30, 'Bank Fees', '402', 40.00, 0, 'Service fee', 'SERVICE FEE');
-    spend(2025, 12, 31, 'Bank Fees', '402', 12.00, 0, 'Unknown - BANK CHQ ISSUE FEE', '');
-    spend(2025, 7, 5, 'Fuel & Lubricants', '449', 168.20, 10, 'Unknown - Fuel & Lubricants', 'PETROGAS');
-    spend(2025, 7, 8, 'Fuel & Lubricants', '449', 59.50, 10, 'Unknown - Fuel & Lubricants', 'LIBERTY');
-    spend(2025, 7, 11, 'Fuel & Lubricants', '449', 51.40, 10, 'Unknown - Fuel & Lubricants', 'LIBERTY');
-    return { Journals: J };
+    spend(2025, 8, 12, '404', 723.34, 'INPUT', 10, 'CHEQUE 0000722', '0000722', null);
+    spend(2025, 10, 3, '404', 181.82, 'INPUT', 10, 'CHEQUE 0000730', '', 'Vicpass');
+    spend(2025, 11, 18, '404', 651.67, 'INPUT', 10, 'CHEQUE 0000730', '', 'Vicpass');
+    spend(2026, 2, 9, '404', 1219.98, 'INPUT', 10, 'CHEQUE 0000750', '0000750- Vicpass', null);
+    spend(2025, 7, 30, '402', 10.00, 'EXEMPTEXPENSES', 0, 'ACCOUNT FEES', 'ACCOUNT FEES', null);
+    spend(2025, 9, 30, '402', 40.00, 'EXEMPTEXPENSES', 0, 'Service fee', 'SERVICE FEE', null);
+    spend(2025, 12, 31, '402', 12.00, 'EXEMPTEXPENSES', 0, 'BANK CHQ ISSUE FEE', '', null);
+    spend(2025, 7, 5, '449', 168.20, 'INPUT', 10, 'Fuel & Lubricants', 'PETROGAS', null);
+    spend(2025, 7, 8, '449', 59.50, 'INPUT', 10, 'Fuel & Lubricants', 'LIBERTY', null);
+    spend(2025, 7, 11, '449', 51.40, 'INPUT', 10, 'Fuel & Lubricants', 'LIBERTY', null);
+    const Accounts = [
+      { Code: '404', Name: 'Accounting Fees' }, { Code: '402', Name: 'Bank Fees' }, { Code: '449', Name: 'Fuel & Lubricants' },
+    ];
+    const TaxRates = [
+      { TaxType: 'INPUT', Name: 'GST on Expenses', EffectiveRate: 10 },
+      { TaxType: 'EXEMPTEXPENSES', Name: 'GST Free Expenses', EffectiveRate: 0 },
+    ];
+    return { Accounts, TaxRates, BankTransactions, Invoices: [], ManualJournals: [] };
   })();
 
   const getDemoReport = (type) => DEMO[type] || DEMO.ProfitAndLoss;
@@ -530,6 +577,6 @@
     getDemoReport,
     DEMO,
     DEMO_TENANTS,
-    DEMO_JOURNALS,
+    DEMO_SUBLEDGERS,
   };
 }));

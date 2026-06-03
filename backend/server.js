@@ -33,10 +33,10 @@ const {
   // Granular report scopes (required for apps created on/after 2 Mar 2026; also
   // valid for older apps). The broad "accounting.reports.read" no longer works
   // for new apps and triggers invalid_scope.
-  // accounting.journals.read powers the General Ledger. Xero gates journal access
-  // (Advanced plan / app eligibility); if your app can't use it, "Connect to Xero"
-  // will fail with invalid_scope — that failure IS the access test on this branch.
-  XERO_SCOPES = 'openid profile email offline_access accounting.reports.profitandloss.read accounting.reports.balancesheet.read accounting.reports.trialbalance.read accounting.reports.banksummary.read accounting.reports.executivesummary.read accounting.budgets.read accounting.journals.read',
+  // The General Ledger is reconstructed from sub-ledgers (bank transactions,
+  // invoices/bills, manual journals) because the Journals API requires a premium
+  // Xero plan. These read-only granular scopes are available on any plan.
+  XERO_SCOPES = 'openid profile email offline_access accounting.reports.profitandloss.read accounting.reports.balancesheet.read accounting.reports.trialbalance.read accounting.reports.banksummary.read accounting.reports.executivesummary.read accounting.budgets.read accounting.settings.read accounting.banktransactions.read accounting.invoices.read accounting.manualjournals.read',
   PORT = 3000,
   ALLOWED_ORIGIN = '*',
 } = process.env;
@@ -233,53 +233,56 @@ app.get('/api/report', async (req, res) => {
   }
 });
 
-// Parse Xero's JSON date formats ("/Date(ms+0000)/" or ISO) into a Date.
-function parseXeroDate(s) {
-  if (!s) return null;
-  const m = /\/Date\((-?\d+)/.exec(String(s));
-  return m ? new Date(parseInt(m[1], 10)) : new Date(s);
+// Fetch all pages (100/page) of a list endpoint, optionally with a `where` filter.
+async function fetchAllPages(token, tenantId, endpoint, key, where) {
+  const out = [];
+  for (let page = 1; page <= 100; page++) {
+    const url = new URL(`${XERO_API_BASE}/${endpoint}`);
+    url.searchParams.set('page', String(page));
+    if (where) url.searchParams.set('where', where);
+    const r = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${token}`, 'Xero-tenant-id': tenantId, Accept: 'application/json' },
+    });
+    if (!r.ok) { const t = await r.text(); const e = new Error(t || `HTTP ${r.status}`); e.status = r.status; e.endpoint = endpoint; throw e; }
+    const arr = (JSON.parse(await r.text())[key]) || [];
+    out.push(...arr);
+    if (arr.length < 100) break;
+  }
+  return out;
 }
 
-// General Ledger source: pages through the Journals endpoint (100 at a time,
-// offset by JournalNumber) and filters by JournalDate to the requested period.
-// The Journals API has no date filter, so we page from the start; a page cap
-// guards against very large ledgers. Requires accounting.journals.read AND
-// journal access on the org's Xero plan.
-app.get('/api/journals', async (req, res) => {
+// Build a Xero `where` date clause, e.g. Date>=DateTime(2025,7,1)&&Date<=DateTime(2026,6,30)
+function dateClause(fromDate, toDate) {
+  const fmt = (s) => { const d = new Date(s); return `DateTime(${d.getUTCFullYear()},${d.getUTCMonth() + 1},${d.getUTCDate()})`; };
+  const parts = [];
+  if (fromDate) parts.push(`Date>=${fmt(fromDate)}`);
+  if (toDate) parts.push(`Date<=${fmt(toDate)}`);
+  return parts.join('&&');
+}
+
+// General Ledger source: the Journals API needs a premium plan, so we
+// reconstruct the GL from sub-ledgers. Fetches the chart of accounts + tax rates
+// (for names) plus posted bank transactions, invoices/bills and manual journals
+// for the period. The frontend assembles these into the GL (see report-core).
+app.get('/api/generalledger', async (req, res) => {
   const { tenantId, fromDate, toDate } = req.query;
   if (!tenantId) return res.status(400).json({ error: 'Missing tenantId' });
-  const from = fromDate ? new Date(fromDate) : null;
-  const to = toDate ? new Date(toDate + 'T23:59:59') : null;
+  const dc = dateClause(fromDate, toDate);
+  const withStatus = (status) => [dc, status].filter(Boolean).join('&&');
   try {
     const token = await getValidAccessToken();
-    const all = [];
-    let offset = 0;
-    const MAX_PAGES = 200; // up to ~20,000 journals
-    let pages = 0;
-    for (; pages < MAX_PAGES; pages++) {
-      const url = new URL(`${XERO_API_BASE}/Journals`);
-      if (offset) url.searchParams.set('offset', String(offset));
-      const r = await fetch(url.toString(), {
-        headers: { Authorization: `Bearer ${token}`, 'Xero-tenant-id': tenantId, Accept: 'application/json' },
-      });
-      if (!r.ok) {
-        const t = await r.text();
-        return res.status(r.status).json({ error: t || `HTTP ${r.status}`, where: 'journals' });
-      }
-      const journals = (JSON.parse(await r.text()).Journals) || [];
-      if (!journals.length) break;
-      for (const j of journals) {
-        const d = parseXeroDate(j.JournalDate);
-        if ((!from || d >= from) && (!to || d <= to)) all.push(j);
-        offset = Math.max(offset, j.JournalNumber || 0);
-      }
-      if (journals.length < 100) break;
-      const lastDate = parseXeroDate(journals[journals.length - 1].JournalDate);
-      if (to && lastDate && lastDate > to) break; // past the period; stop paging
-    }
-    res.json({ Journals: all, pages, capped: pages >= MAX_PAGES });
+    const get1 = async (endpoint, key) => {
+      const r = await fetch(`${XERO_API_BASE}/${endpoint}`, { headers: { Authorization: `Bearer ${token}`, 'Xero-tenant-id': tenantId, Accept: 'application/json' } });
+      if (!r.ok) { const t = await r.text(); const e = new Error(t || `HTTP ${r.status}`); e.status = r.status; e.endpoint = endpoint; throw e; }
+      return (JSON.parse(await r.text())[key]) || [];
+    };
+    const [Accounts, TaxRates] = await Promise.all([get1('Accounts', 'Accounts'), get1('TaxRates', 'TaxRates')]);
+    const BankTransactions = await fetchAllPages(token, tenantId, 'BankTransactions', 'BankTransactions', withStatus('Status=="AUTHORISED"'));
+    const Invoices = await fetchAllPages(token, tenantId, 'Invoices', 'Invoices', withStatus('(Status=="AUTHORISED"||Status=="PAID")'));
+    const ManualJournals = await fetchAllPages(token, tenantId, 'ManualJournals', 'ManualJournals', withStatus('Status=="POSTED"'));
+    res.json({ Accounts, TaxRates, BankTransactions, Invoices, ManualJournals });
   } catch (e) {
-    res.status(e.status || 500).json({ error: e.message });
+    res.status(e.status || 500).json({ error: e.message, endpoint: e.endpoint });
   }
 });
 

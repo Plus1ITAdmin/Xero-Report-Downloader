@@ -39,7 +39,7 @@ const xlsxPath = path.join(outDir, 'sample-combined.xlsx');
 fs.writeFileSync(xlsxPath, Buffer.from(R.xlsxWrite(wb)));
 
 // General Ledger Detail (landscape PDF + Excel) from synthetic journals.
-const gl = ReportCore.buildGeneralLedger(ReportCore.DEMO_JOURNALS, { orgName: 'Demo Company (AU)', fromDate: '2025-07-01', toDate: '2026-06-30' });
+const gl = ReportCore.buildGeneralLedger(ReportCore.DEMO_SUBLEDGERS, { orgName: 'Demo Company (AU)', fromDate: '2025-07-01', toDate: '2026-06-30' });
 const glDoc = R.singlePdf(gl, 'Demo Company (AU)');
 const glPdfPath = path.join(outDir, 'sample-gl.pdf');
 fs.writeFileSync(glPdfPath, Buffer.from(glDoc.output('arraybuffer')));

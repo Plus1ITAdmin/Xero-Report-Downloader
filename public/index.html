@@ -579,11 +579,11 @@
     return JSON.parse(text);
   }
 
-  // General Ledger source — pulls journals (paginated server-side) for the period.
-  async function fetchJournals(report) {
+  // General Ledger source — pulls sub-ledgers (paginated server-side) for the period.
+  async function fetchGeneralLedger(report) {
     const p = paramsFor(report);
     const qs = new URLSearchParams({ tenantId: state.selectedTenantId, fromDate: p.fromDate || "", toDate: p.toDate || "" });
-    const r = await fetch(`${API_BASE}/api/journals?${qs.toString()}`);
+    const r = await fetch(`${API_BASE}/api/generalledger?${qs.toString()}`);
     const text = await r.text();
     if (!r.ok) {
       let msg = `HTTP ${r.status}`;
@@ -658,8 +658,8 @@
         let normalized;
         if (r.special === "gl") {
           const p = paramsFor(r);
-          const journals = state.demo ? ReportCore.DEMO_JOURNALS : await fetchJournals(r);
-          normalized = ReportCore.buildGeneralLedger(journals, { orgName: org, fromDate: p.fromDate, toDate: p.toDate });
+          const data = state.demo ? ReportCore.DEMO_SUBLEDGERS : await fetchGeneralLedger(r);
+          normalized = ReportCore.buildGeneralLedger(data, { orgName: org, fromDate: p.fromDate, toDate: p.toDate });
         } else {
           normalized = ReportCore.parseReport(await fetchReportJson(r));
         }
