@@ -193,6 +193,21 @@
       <div class="step-head"><span class="step-num">3</span><h2>Choose reports &amp; dates</h2></div>
 
       <div class="controls-grid">
+        <div class="field">
+          <label for="datePreset">Quick range</label>
+          <select id="datePreset">
+            <option value="">Custom…</option>
+            <option value="thisMonth">This month</option>
+            <option value="thisQuarter">This quarter</option>
+            <option value="thisFY">This financial year</option>
+            <option value="lastMonth">Last month</option>
+            <option value="lastQuarter">Last quarter</option>
+            <option value="lastFY">Last financial year</option>
+            <option value="monthToDate">Month to date</option>
+            <option value="quarterToDate">Quarter to date</option>
+            <option value="yearToDate">Year to date</option>
+          </select>
+        </div>
         <div class="field"><label for="masterStart">Period start (date-range reports)</label><input type="date" id="masterStart" /></div>
         <div class="field"><label for="masterEnd">Period end / as-at date</label><input type="date" id="masterEnd" /></div>
         <div class="field">
@@ -269,10 +284,6 @@
   const REPORTS = [
     { id: "ProfitAndLoss",    name: "Profit and Loss",   dateType: "range", periods: true  },
     { id: "BalanceSheet",     name: "Balance Sheet",     dateType: "asAt",  periods: true  },
-    { id: "TrialBalance",     name: "Trial Balance",     dateType: "asAt",  periods: false },
-    { id: "BankSummary",      name: "Bank Summary",      dateType: "range", periods: false },
-    { id: "ExecutiveSummary", name: "Executive Summary", dateType: "asAt",  periods: false },
-    { id: "BudgetSummary",    name: "Budget Summary",    dateType: "asAt",  periods: true  },
     { id: "GeneralLedger",    name: "General Ledger Detail", dateType: "range", periods: false, special: "gl" },
   ];
 
@@ -292,10 +303,46 @@
   const el = (id) => document.getElementById(id);
 
   // ---- date helpers --------------------------------------------------------
-  const iso = (d) => d.toISOString().slice(0, 10);
+  // Local calendar date as YYYY-MM-DD. (Plain toISOString() is UTC, which rolls
+  // AU dates back a day — e.g. 1 Jul shows as 30 Jun.)
+  const iso = (d) => { const z = new Date(d.getTime() - d.getTimezoneOffset() * 60000); return z.toISOString().slice(0, 10); };
   function financialYearStart(today) {
     const y = today.getFullYear();
     return iso(new Date(today.getMonth() >= 6 ? y : y - 1, 6, 1)); // 1 July (AU FY)
+  }
+  // Quick-range presets (AU financial year = 1 Jul–30 Jun, calendar quarters).
+  function presetRange(key) {
+    const now = new Date();
+    const Y = now.getFullYear(), M = now.getMonth();          // month 0-11
+    const mk = (y, m, d) => new Date(y, m, d);
+    const eom = (y, m) => mk(y, m + 1, 0);                    // last day of month m
+    const fyStart = (M >= 6) ? Y : Y - 1;                     // FY starts 1 July
+    const qStart = Math.floor(M / 3) * 3;                     // calendar quarter start month
+    switch (key) {
+      case "thisMonth":     return { start: mk(Y, M, 1),          end: eom(Y, M) };
+      case "thisQuarter":   return { start: mk(Y, qStart, 1),     end: eom(Y, qStart + 2) };
+      case "thisFY":        return { start: mk(fyStart, 6, 1),    end: mk(fyStart + 1, 5, 30) };
+      case "lastMonth": {
+        const y = M === 0 ? Y - 1 : Y, m = M === 0 ? 11 : M - 1;
+        return { start: mk(y, m, 1), end: eom(y, m) };
+      }
+      case "lastQuarter": {
+        const d = mk(Y, qStart - 3, 1), y = d.getFullYear(), m = d.getMonth();
+        return { start: mk(y, m, 1), end: eom(y, m + 2) };
+      }
+      case "lastFY":        return { start: mk(fyStart - 1, 6, 1), end: mk(fyStart, 5, 30) };
+      case "monthToDate":   return { start: mk(Y, M, 1),          end: now };
+      case "quarterToDate": return { start: mk(Y, qStart, 1),     end: now };
+      case "yearToDate":    return { start: mk(fyStart, 6, 1),    end: now };
+      default: return null;
+    }
+  }
+  function applyDatePreset(key) {
+    const r = presetRange(key);
+    if (!r) return;
+    el("masterStart").value = iso(r.start);
+    el("masterEnd").value = iso(r.end);
+    if (state.individualDates) applyMasterToAll();
   }
   function avatarColor(name) {
     let h = 0;
@@ -684,10 +731,11 @@
   // Wire-up
   // =====================================================================
   function init() {
-    // default dates
+    // default dates: this financial year to date
     const today = new Date();
     el("masterEnd").value = iso(today);
     el("masterStart").value = financialYearStart(today);
+    el("datePreset").value = "yearToDate";
 
     buildReportList();
     updatePackagingLabels();
@@ -707,6 +755,9 @@
     document.addEventListener("click", (e) => { if (!el("org").contains(e.target)) closeOrg(); });
 
     // Dates + comparison
+    el("datePreset").addEventListener("change", (e) => applyDatePreset(e.target.value));
+    el("masterStart").addEventListener("change", () => { el("datePreset").value = ""; });
+    el("masterEnd").addEventListener("change", () => { el("datePreset").value = ""; });
     el("individualToggle").addEventListener("change", (e) => { state.individualDates = e.target.checked; if (e.target.checked) prefillIndividualDates(); syncIndividualDateVisibility(); });
     el("applyAllBtn").addEventListener("click", applyMasterToAll);
     el("compareMode").addEventListener("change", (e) => el("compareCustom").classList.toggle("show", e.target.value === "custom"));

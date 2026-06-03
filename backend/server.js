@@ -40,7 +40,7 @@ const {
   // include pay-run journals (wages, PAYG, super, net pay). They're optional:
   // if the org has no payroll or the scope isn't granted, the payroll fetch is
   // skipped and the rest of the GL still builds.
-  XERO_SCOPES = 'openid profile email offline_access accounting.reports.profitandloss.read accounting.reports.balancesheet.read accounting.reports.trialbalance.read accounting.reports.banksummary.read accounting.reports.executivesummary.read accounting.budgets.read accounting.settings.read accounting.banktransactions.read accounting.invoices.read accounting.manualjournals.read accounting.payments.read payroll.payruns.read payroll.settings.read',
+  XERO_SCOPES = 'openid profile email offline_access accounting.reports.profitandloss.read accounting.reports.balancesheet.read accounting.settings.read accounting.banktransactions.read accounting.invoices.read accounting.manualjournals.read accounting.payments.read payroll.payruns.read payroll.settings.read',
   PORT = 3000,
   ALLOWED_ORIGIN = '*',
 } = process.env;
@@ -57,10 +57,6 @@ const XERO_PAYROLL_BASE = 'https://api.xero.com/payroll.xro/1.0'; // AU Payroll
 const REPORT_PARAMS = {
   ProfitAndLoss: ['fromDate', 'toDate', 'periods', 'timeframe', 'trackingCategoryID', 'trackingOptionID', 'standardLayout', 'paymentsOnly'],
   BalanceSheet: ['date', 'periods', 'timeframe', 'trackingOptionID1', 'trackingOptionID2', 'standardLayout', 'paymentsOnly'],
-  TrialBalance: ['date', 'paymentsOnly'],
-  BankSummary: ['fromDate', 'toDate'],
-  ExecutiveSummary: ['date'],
-  BudgetSummary: ['date', 'periods', 'timeframe'],
 };
 
 if (!XERO_CLIENT_ID || !XERO_CLIENT_SECRET) {
